@@ -1,0 +1,26 @@
+[project]
+name = "tpu-microbenchmark"
+version = "0.1.0"
+description = "TPU microbenchmark suite: HBM, VMEM, GEMM, PCIe, and ICI bandwidth tests"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "absl-py",
+    "jax[tpu]>=0.4; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "jaxlib",
+    "jsonlines>=4.0",
+    "numpy>=2.0",
+    "tpu-info>=0.14.0",
+]
+
+[tool.uv]
+find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
+index-strategy = "first-index"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+
+[[tool.uv.index]]
+name = "artlab"
+url = "http://artlab.alibaba-inc.com/1/pypi/pypi-releases"
