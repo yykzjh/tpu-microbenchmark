@@ -21,8 +21,9 @@ def test_shell_syntax_and_help(script):
     assert "Usage:" in result.stdout
 
 
-@pytest.mark.parametrize("fail_rank", [None, "2"])
-def test_ici_four_host_tree_collects_logs_and_propagates_failure(tmp_path, fail_rank):
+@pytest.mark.parametrize("host_count", [2, 4])
+@pytest.mark.parametrize("fail_rank", [None, "1"])
+def test_ici_tree_collects_logs_and_propagates_failure(tmp_path, fail_rank, host_count):
     version = subprocess.check_output([BASH, "-c", 'echo "${BASH_VERSINFO[0]}"'], text=True)
     if int(version.strip()) < 4:
         pytest.skip("Distributed launchers require Linux/Bash 4+ (see README)")
@@ -55,15 +56,17 @@ def test_ici_four_host_tree_collects_logs_and_propagates_failure(tmp_path, fail_
     # Recursive commands resolve the same explicitly selected Bash.
     (bin_dir / "bash").symlink_to(BASH)
     hostfile = repo / "hostfile"
-    hostfile.write_text("host0\nhost1\nhost2\nhost3\n")
+    hostfile.write_text("".join(f"host{rank}\n" for rank in range(host_count)))
     env = dict(os.environ, NODE_SN_NAME="host0", TEST_BASH=BASH, LC_ALL="C")
     if fail_rank is not None:
         env["FAIL_RANK"] = fail_rank
     command = [BASH, str(repo / "scripts/ici/test_multinode_ici.sh"),
                "--hostfile", str(hostfile), "--mode", "allreduce_parallel",
-               "--block-range", "0:2,0:2,0:2", "--allreduce-data-size", "4GiB",
+               "--allreduce-data-size", "4GiB",
                "--warmup", "2", "--iterations", "5", "--xprof-timing",
                "--ssh-user", "tester", "--ssh-port", "2222"]
+    if host_count == 4:
+        command.extend(["--block-range", "0:2,0:2,0:2"])
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, env=env, start_new_session=True)
     try:
@@ -74,11 +77,14 @@ def test_ici_four_host_tree_collects_logs_and_propagates_failure(tmp_path, fail_
             process.communicate()
     assert (process.returncode == 0) == (fail_rank is None), stdout + stderr
     logs = list((repo / "logs/ici").glob("*.log"))
-    assert len(logs) == 4
+    assert len(logs) == host_count
     for log in logs:
         content = log.read_text()
-        assert '"--process-count", "4"' in content
-        assert '"--block-range", "0:2,0:2,0:2"' in content
+        assert f'"--process-count", "{host_count}"' in content
+        if host_count == 4:
+            assert '"--block-range", "0:2,0:2,0:2"' in content
+        else:
+            assert '"--block-range"' not in content
         assert '"--parallel"' in content
         assert '"--xprof-timing"' in content
     assert not list((repo / "logs/.tmp").iterdir())

@@ -47,8 +47,6 @@ Create your own `hostfile` in the repository, one reachable host/IP per line:
 ```text
 tpu-host-0
 tpu-host-1
-tpu-host-2
-tpu-host-3
 ```
 
 Blank lines and lines starting with `#` are ignored. Use unique bare hostnames
@@ -69,13 +67,13 @@ keys fail. Distribute/verify keys using your normal administration process.
 TCP 8476 (the JAX coordinator) and the TPU runtime communication paths must
 also be reachable. Do not run concurrent benchmarks against the same Slice.
 
-## Retest a 2x2x2 AllReduce block within a 2x2x4 Slice
+## Retest AllReduce on a two-host 2x2x2 Slice
 
-Keep **all four hosts** of the 2x2x4 Slice in the hostfile. Every host joins
-distributed JAX initialization, but communication is restricted to the selected
-chip block. Do not reduce the hostfile to just the two hosts in that block.
-Block coordinates are chip coordinates, not hostfile indices; Python discovers
-the device topology at runtime.
+Use an **independent two-host 2x2x2 Slice**, with four TPU chips per host.
+Put both hosts in the two-line hostfile above. The launcher derives the process
+count from this file; Python discovers the device topology at runtime. Omitting
+`--block-range` tests the entire Slice. The hostfile does not provision or resize
+a Slice: selecting two hosts from an existing four-host Slice is not equivalent.
 
 From host 0, inside the repository:
 
@@ -83,7 +81,6 @@ From host 0, inside the repository:
 bash scripts/ici/test_multinode_ici.sh \
   --hostfile ./hostfile \
   --mode allreduce_parallel \
-  --block-range '0:2,0:2,0:2' \
   --allreduce-data-size 4GiB \
   --warmup 2 --iterations 5 \
   --xprof-timing
@@ -93,23 +90,21 @@ This launches only parallel AllReduce, with temporary Xprof device timing.
 For root containers append `--ssh-user root --ssh-port 2222`.
 The root collects one log per host under `logs/ici/`. Successful execution
 means the benchmark completed and produced metrics, not that a performance
-threshold was met. Non-participating ranks may have no block metric.
+threshold was met. Both hosts participate in this full-Slice retest.
 
-To compare another block, rerun sequentially with
-`--block-range '0:2,0:2,1:3'` or `'0:2,0:2,2:4'`. To compare CPU timing,
-omit `--xprof-timing`; do not change any other parameters.
+To compare CPU timing, omit `--xprof-timing`; do not change any other parameters.
 
-Without SSH, execute the Python program **on all four hosts concurrently**,
-using the same coordinator and count and a unique rank 0, 1, 2, 3:
+Without SSH, execute the Python program **on both hosts concurrently**,
+using the same coordinator and count, with rank 0 on the first host and rank 1
+on the second. Replace the placeholder coordinator hostname below locally:
 
 ```bash
-# Set RANK to this host's index in the four-host process group.
+# Set RANK=0 on the first host and RANK=1 on the second host.
 RANK=0
 uv run --locked python src/ici/test_ici.py ar \
   --runtime-scope slice \
   --coordinator-address tpu-host-0:8476 \
-  --process-count 4 --process-id "$RANK" \
-  --block-range '0:2,0:2,0:2' \
+  --process-count 2 --process-id "$RANK" \
   --data-size 4GiB --warmup 2 --iteration 5 \
   --parallel --xprof-timing
 ```
@@ -164,8 +159,8 @@ bash scripts/ici/test_multinode_ici.sh \
 ```
 
 `neighbors` skips Self, tests both chiplets bidirectionally within every chip,
-and tests chiplet 0 to chiplet 0 on adjacent chips. For a 2x2x4 mesh this is
-32 Die-to-Die plus 56 directed Chip-to-Chip pairs. Axes up to length 4 do not
+and tests chiplet 0 to chiplet 0 on adjacent chips. For a 2x2x2 mesh this is
+16 Die-to-Die plus 24 directed Chip-to-Chip pairs. Axes up to length 4 do not
 wrap. Larger Slice adjacency is deliberately rejected in this mode.
 
 ## Logs and timing
@@ -174,6 +169,9 @@ Shell logs are timestamped and include node identity, per-stage wall times,
 and `[COMMPILOT_METRIC]` structured results for compatibility. They live in
 `logs/gemm/`, `logs/tpubandwidth/`, `logs/ici/` or `logs/iperf/`.
 No result log is automatically uploaded.
+Logs contain real node identities and runtime details; keep them private or
+redact those fields before sharing. Only placeholder hostnames belong in public
+examples; never commit real hostfiles, node identifiers or private IP addresses.
 
 CPU timing is the default. `--xprof-timing` selects device-trace timing;
 shell `--xprof-modes <csv>` selects individual subtests and, when nonempty,
