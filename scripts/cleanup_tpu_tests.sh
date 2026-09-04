@@ -1,25 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+
+
+# CommPilot second-precision timing markers.
+timing_event_at() {
+    local timestamp="$1"
+    local phase="$2"
+    local event="$3"
+    shift 3
+    printf '[TIMING] timestamp=%s phase=%s event=%s script=%s' \
+        "${timestamp}" "${phase}" "${event}" "${BASH_SOURCE[0]##*/}" >&2
+    if (( $# > 0 )); then
+        printf ' %s' "$@" >&2
+    fi
+    printf '\n' >&2
+}
+
+timing_event() {
+    local phase="$1"
+    local event="$2"
+    shift 2
+    timing_event_at "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${phase}" "${event}" "$@"
+}
+
+TIMING_SCRIPT_STARTED_EPOCH="$(date +%s)"
+TIMING_SCRIPT_STARTED_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+timing_finish() {
+    local exit_code="${1:-$?}"
+    local finished_epoch
+    finished_epoch="$(date +%s)"
+    timing_event script end \
+        "exit_code=${exit_code}" \
+        "duration_seconds=$((finished_epoch - TIMING_SCRIPT_STARTED_EPOCH))"
+}
+
+timing_event_at "${TIMING_SCRIPT_STARTED_AT}" script start
+trap timing_finish EXIT
+
 DRY_RUN=0
-TERM_GRACE_SECONDS="${TERM_GRACE_SECONDS:-3}"
-LIBTPU_LOCKFILE="${LIBTPU_LOCKFILE:-/tmp/libtpu_lockfile}"
+TERM_GRACE_SECONDS=3
+LIBTPU_LOCKFILE="/tmp/libtpu_lockfile"
 
 usage() {
   cat <<'EOF'
-Usage: cleanup_tpu_tests.sh [--dry-run]
+Usage: cleanup_tpu_tests.sh [options]
 
 Stop CommPilot TPU benchmark processes on the current host and remove the
 libtpu lock file.
 
 Options:
-  --dry-run   Print matching processes and cleanup actions without killing
-              processes or removing files.
-  -h, --help  Show this help.
-
-Environment:
-  TERM_GRACE_SECONDS  Seconds to wait after SIGTERM before SIGKILL. Default: 3.
-  LIBTPU_LOCKFILE     Lock file to remove. Default: /tmp/libtpu_lockfile.
+  --dry-run             Print actions without changing the host.
+  --grace-seconds <N>   Wait before SIGKILL. Default: 3.
+  --lockfile <path>     libtpu lock file. Default: /tmp/libtpu_lockfile.
+  -h, --help            Show this help.
 EOF
 }
 
@@ -27,6 +64,16 @@ while (($# > 0)); do
   case "$1" in
     --dry-run)
       DRY_RUN=1
+      ;;
+    --grace-seconds)
+      [[ $# -ge 2 ]] || { echo "--grace-seconds requires a value" >&2; exit 2; }
+      TERM_GRACE_SECONDS="$2"
+      shift
+      ;;
+    --lockfile)
+      [[ $# -ge 2 ]] || { echo "--lockfile requires a value" >&2; exit 2; }
+      LIBTPU_LOCKFILE="$2"
+      shift
       ;;
     -h|--help)
       usage
@@ -41,7 +88,10 @@ while (($# > 0)); do
   shift
 done
 
-TPU_TEST_PATTERN='acceptance/platform/TPU/common/src/(ici/test_ici|gemm/test_gemm|memory/test_(hbm|vmem)|pcie/test_pcie)\.py'
+[[ "${TERM_GRACE_SECONDS}" =~ ^[0-9]+$ ]] \
+  || { echo "--grace-seconds must be a non-negative integer" >&2; exit 2; }
+
+TPU_TEST_PATTERN='(src/(ici/test_ici|gemm/test_gemm|memory/test_(hbm|vmem)|pcie/test_pcie)\.py|scripts/(gemm/test_gemm|tpubandwidth/test_tpubandwidth|ici/test_multinode_ici)\.sh|python[^ ]* -m src\.(ici\.test_ici|gemm\.test_gemm|memory\.test_(hbm|vmem)|pcie\.test_pcie))'
 
 list_matching_pids() {
   pgrep -f "$TPU_TEST_PATTERN" | awk -v self="$$" '$0 != self' || true

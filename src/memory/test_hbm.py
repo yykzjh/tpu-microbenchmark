@@ -16,8 +16,9 @@ Kernel optimizations for approaching hardware peak:
 
 Test workflow (aligned with ICI test):
 - Phase 1: Warmup iterations
-- Phase 2: Timed iterations with xprof traces
-- Phase 3: HLO dump collection (if --dump-hlo)
+- Phase 2: CPU wall-clock timing with explicit device synchronization
+- Optional: temporary Xprof timing when ``--xprof-timing`` is passed
+- Optional: retained Xprof trace and HLO dump collection with ``--profile``
 """
 
 from __future__ import annotations
@@ -39,8 +40,9 @@ from utils.runtime import (
     configure_logging,
     configure_dump_hlo_from_argv,
     configure_tpu_benchmark_env,
+    default_profile_result_dir,
     device_metadata,
-    initialize_jax_runtime,
+    initialize_local_jax_runtime,
     prepare_benchmark_dirs,
 )
 from utils.units import parse_data_size
@@ -68,7 +70,7 @@ def load_jax_runtime_deps() -> None:
     global jax, jnp, pl, pltpu, MARKER, delete_device_object
     global hbm_copy_kernel, hbm_read_kernel, hbm_write_kernel
     global create_test_array, run_memory_benchmark_across_devices
-    global run_traced_bandwidth_phases
+    global run_bandwidth_phases
 
     import jax as _jax
     import jax.numpy as _jnp
@@ -86,7 +88,7 @@ def load_jax_runtime_deps() -> None:
     from memory.arrays import create_test_array as _create_test_array
     from memory.benchmark import (
         run_memory_benchmark_across_devices as _run_memory_benchmark_across_devices,
-        run_traced_bandwidth_phases as _run_traced_bandwidth_phases,
+        run_bandwidth_phases as _run_bandwidth_phases,
     )
 
     jax = _jax
@@ -100,7 +102,7 @@ def load_jax_runtime_deps() -> None:
     hbm_write_kernel = _hbm_write_kernel
     create_test_array = _create_test_array
     run_memory_benchmark_across_devices = _run_memory_benchmark_across_devices
-    run_traced_bandwidth_phases = _run_traced_bandwidth_phases
+    run_bandwidth_phases = _run_bandwidth_phases
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +118,9 @@ def run_hbm_per_device(
     dtype: jnp.dtype,
     warmup: int,
     iteration: int,
-    result_dir: str,
-    dump_hlo: bool = False,
-    cleanup_trace: bool = False,
+    result_dir: str | None,
+    profile_artifacts: bool = False,
+    use_xprof_timing: bool = False,
 ) -> dict[str, Any]:
     """
     Run HBM bandwidth benchmark on a single device.
@@ -133,8 +135,8 @@ def run_hbm_per_device(
         warmup: Number of warmup iterations
         iteration: Number of timed iterations
         result_dir: Base directory for results
-        dump_hlo: Enable HLO dump collection
-        cleanup_trace: Cleanup trace directory after extracting durations
+        profile_artifacts: Persist Xprof traces and HLO dumps
+        use_xprof_timing: Use temporary Xprof traces as the timing source
 
     Returns:
         Dict with metadata, metrics, and output_directory
@@ -184,7 +186,12 @@ def run_hbm_per_device(
         f"{ts}_hbm_{mode}_device{device_index}_bs{vmem_buffer_shape[0]}x{vmem_buffer_shape[1]}_"
         f"{dtype_name}_{data_size_label}"
     )
-    dirs = prepare_benchmark_dirs(result_dir, run_name, dump_hlo=dump_hlo)
+    dirs = prepare_benchmark_dirs(
+        result_dir,
+        run_name,
+        dump_hlo=profile_artifacts,
+        create_trace=profile_artifacts,
+    )
     out_dir = dirs.output_dir
     metrics_dir = dirs.metrics_dir
     trace_dir = dirs.trace_dir
@@ -358,11 +365,11 @@ def run_hbm_per_device(
         "actual_data_bytes": actual_data_bytes,
         "warmup": warmup,
         "iteration": iteration,
-        "dump_hlo": dump_hlo,
-        "cleanup_trace": cleanup_trace,
+        "profile_artifacts": profile_artifacts,
+        "timing_mode": "xprof" if use_xprof_timing else "cpu",
     }
     try:
-        metrics = run_traced_bandwidth_phases(
+        metrics = run_bandwidth_phases(
             compiled_fn=compiled_fn,
             data_generator=data_generator,
             data_bytes=data_bytes,
@@ -372,12 +379,13 @@ def run_hbm_per_device(
             iteration=iteration,
             metrics_dir=metrics_dir,
             trace_dir=trace_dir,
-            dump_hlo=dump_hlo,
-            dump_hlo_source_dir=_DUMP_HLO.temp_dir,
+            dump_hlo=profile_artifacts,
+            dump_hlo_source_dir=_DUMP_HLO.dump_dir,
             dump_hlo_dir=dump_hlo_dir,
-            clear_hlo_source=_DUMP_HLO.owned,
-            cleanup_trace=cleanup_trace,
+            clear_hlo_source=False,
+            profile_artifacts=profile_artifacts,
             logger=logger,
+            use_xprof_timing=use_xprof_timing,
         )
         return {
             "metadata": metadata,
@@ -396,9 +404,9 @@ def run_hbm(
     dtype: jnp.dtype,
     warmup: int,
     iteration: int,
-    result_dir: str,
-    dump_hlo: bool = False,
-    cleanup_trace: bool = False,
+    result_dir: str | None,
+    profile_artifacts: bool = False,
+    use_xprof_timing: bool = False,
 ) -> dict[str, Any]:
     """
     Run HBM bandwidth benchmark across all local TPU devices.
@@ -408,8 +416,8 @@ def run_hbm(
 
     Phases per device:
       1. Warmup iterations
-      2. Timed iterations with xprof traces
-      3. HLO dump collection (if dump_hlo=True)
+      2. CPU synchronized timing, or Xprof timing when explicitly enabled
+      3. Xprof trace and HLO collection when profile_artifacts=True
 
     Args:
         mode: Test mode ('read', 'write', 'copy')
@@ -419,13 +427,15 @@ def run_hbm(
         warmup: Number of warmup iterations
         iteration: Number of timed iterations
         result_dir: Base directory for results
-        dump_hlo: Enable HLO dump collection
-        cleanup_trace: Cleanup trace directory after extracting durations
+        profile_artifacts: Persist Xprof traces and HLO dumps
+        use_xprof_timing: Use temporary Xprof traces as the timing source
 
     Returns:
         Dict with metadata, per_device_results, aggregate_metrics, and output_directory
     """
     validate_memory_mode(mode)
+    if profile_artifacts and result_dir is None:
+        result_dir = default_profile_result_dir("tpubandwidth")
     vmem_buffer_shape = tuple(block_shape)
     pipeline_banks = 4
     vmem_buffer_count = pipeline_banks
@@ -475,11 +485,11 @@ def run_hbm(
             **parsed_data_size.metadata(),
             "warmup": warmup,
             "iteration": iteration,
-            "dump_hlo": dump_hlo,
-            "cleanup_trace": cleanup_trace,
+            "profile_artifacts": profile_artifacts,
+            "timing_mode": "xprof" if use_xprof_timing else "cpu",
         }
 
-    def per_device_runner(device_index: int, device: Any, out_dir: str) -> dict[str, Any]:
+    def per_device_runner(device_index: int, device: Any, out_dir: str | None) -> dict[str, Any]:
         return run_hbm_per_device(
             mode=mode,
             device=device,
@@ -490,8 +500,8 @@ def run_hbm(
             warmup=warmup,
             iteration=iteration,
             result_dir=out_dir,
-            dump_hlo=dump_hlo,
-            cleanup_trace=cleanup_trace,
+            profile_artifacts=profile_artifacts,
+            use_xprof_timing=use_xprof_timing,
         )
 
     return run_memory_benchmark_across_devices(
@@ -524,7 +534,7 @@ def main():
 
     configure_logging()
     load_jax_runtime_deps()
-    initialize_jax_runtime(logger)
+    initialize_local_jax_runtime(logger)
 
     dtype = parse_memory_dtype(args.dtype)
     block_shape = tuple(args.block_shape)
@@ -540,8 +550,8 @@ def main():
             warmup=args.warmup,
             iteration=args.iteration,
             result_dir=args.result_dir,
-            dump_hlo=args.dump_hlo,
-            cleanup_trace=args.cleanup_trace,
+            profile_artifacts=args.profile,
+            use_xprof_timing=args.xprof_timing,
         )
         all_results.append(results)
 
@@ -549,7 +559,5 @@ def main():
 
     if args.mode == 'all':
         print_memory_mode_summary(all_results)
-
-
 if __name__ == '__main__':
     main()

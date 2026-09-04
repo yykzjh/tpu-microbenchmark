@@ -5,12 +5,15 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.distributed import global_state as distributed_global_state
+from jax.sharding import PartitionSpec as P
 
 from ici.cleanup import release_compiled_cache
 from ici.constants import (
@@ -23,7 +26,9 @@ from ici.constants import (
 from ici.kernels import (
     compile_all_reduce_kernel,
     compile_all_to_all_kernel,
+    create_parallel_chiplet_mesh,
     compile_remote_dma_p2p_kernel,
+    compile_self_copy_kernel,
     compile_traffic_matrix_kernel,
     create_device_mesh,
     make_axis_sharded_payload,
@@ -33,6 +38,7 @@ from ici.phases import (
     _run_benchmark_phases_without_recording,
 )
 from ici.traffic import (
+    TpuBlockRange,
     TrafficCase,
     average_bandwidth,
     build_builtin_tpu_traffic_matrix_str,
@@ -49,20 +55,158 @@ from ici.traffic import (
     infer_tpu_topology,
     local_chiplet_ids,
     manhattan_distance,
+    neighboring_p2p_chiplet_pairs,
     parse_traffic_matrix,
-    should_execute_split_case,
+    parse_tpu_block_range,
     should_record_split_case,
     split_case_local_endpoint_role,
     torus_axis_distances,
     validate_ragged_all_to_all_bounds,
 )
-from ici.zero_crop import detect_zero_crop_available
 from utils.metrics import MetricsStatistics, write_jsonl_metrics
 from utils.profiling import collect_hlo_dumps_if_requested, delete_device_object
-from utils.runtime import prepare_benchmark_dirs, validate_non_negative, validate_positive
+from utils.runtime import (
+    default_profile_result_dir,
+    prepare_benchmark_dirs,
+    validate_non_negative,
+    validate_positive,
+)
 from utils.units import parse_data_size
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_at_process_barrier(name: str) -> None:
+    """Synchronize every initialized JAX process, including idle block hosts."""
+    client = distributed_global_state.client
+    if client is None:
+        raise RuntimeError("JAX distributed client is unavailable for ICI barrier")
+    client.wait_at_barrier(name, timeout_in_ms=600_000)
+
+
+def _case_completion_key(case_index: int) -> str:
+    """Return the coordination-service key for one benchmark case."""
+    return f"commpilot_ici_case_{case_index}_work_complete"
+
+
+def _signal_case_completion(case_index: int) -> None:
+    """Tell idle Slice hosts that all participants completed one case."""
+    client = distributed_global_state.client
+    if client is None:
+        raise RuntimeError("JAX distributed client is unavailable for ICI signal")
+    client.key_value_set(_case_completion_key(case_index), "done")
+
+
+def _wait_for_case_completion(
+    case_index: int,
+    timeout_seconds: int = 1_800,
+) -> None:
+    """Wait without holding idle hosts in a long coordination barrier.
+
+    TPU compilation can exceed the coordination service's effective barrier
+    timeout. Idle processes therefore poll a completion key while the selected
+    block executes, then join the short completion barrier with active hosts.
+    """
+    client = distributed_global_state.client
+    if client is None:
+        raise RuntimeError("JAX distributed client is unavailable for ICI signal")
+    key = _case_completion_key(case_index)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            if client.key_value_try_get(key) == "done":
+                return
+        except Exception as exc:
+            if "NOT_FOUND" not in str(exc):
+                raise
+        time.sleep(1)
+    raise TimeoutError(
+        f"Timed out waiting for active TPU block to complete case {case_index}"
+    )
+
+
+def iter_commpilot_log_metrics(results: dict[str, Any]):
+    """Yield catalog metric name, value, and dimensions for one ICI run."""
+    metadata = results.get("metadata", {})
+    benchmark = metadata.get("benchmark")
+    if benchmark == "p2p":
+        for result in results.get("per_case", []):
+            case_metadata = result.get("metadata", {})
+            src_tpu = case_metadata.get("src_tpu_id")
+            dst_tpu = case_metadata.get("dst_tpu_id")
+            src_core = case_metadata.get("src_core")
+            dst_core = case_metadata.get("dst_core")
+            if src_tpu is None or dst_tpu is None:
+                continue
+            if int(src_tpu) == int(dst_tpu):
+                if src_core == dst_core:
+                    continue
+                metric = "p2p_die_to_die"
+                link_type = "die_to_die"
+            else:
+                metric = "p2p_chip_to_chip"
+                link_type = "chip_to_chip"
+            bandwidth = result.get("metrics", {}).get("bandwidth_GBps")
+            if bandwidth is None:
+                continue
+            yield metric, bandwidth, {
+                "runtime_scope": metadata.get("runtime_scope"),
+                "p2p_pair_mode": metadata.get("p2p_pair_mode", "all"),
+                "slice_topology": metadata.get("slice_topology"),
+                "topology": metadata.get("topology"),
+                "block_range": metadata.get("block_range"),
+                "src_tpu_id": src_tpu,
+                "dst_tpu_id": dst_tpu,
+                "src_core": src_core,
+                "dst_core": dst_core,
+                "link_type": link_type,
+                "src_tpu_coord": case_metadata.get("src_tpu_coord"),
+                "dst_tpu_coord": case_metadata.get("dst_tpu_coord"),
+                "axis_distances": case_metadata.get("tpu_torus_axis_distances"),
+                "distance": case_metadata.get("tpu_torus_manhattan_distance"),
+            }
+        return
+
+    metrics = results.get("metrics", {})
+    bandwidth = metrics.get("bandwidth_GBps", metrics.get("avg_bandwidth_GBps"))
+    if bandwidth is None:
+        return
+    if benchmark == "a2a":
+        metric = (
+            "alltoall_parallel_bisection"
+            if metadata.get("all_to_all_parallel") else "alltoall_bisection"
+        )
+    elif benchmark == "ar":
+        metric = "allreduce_parallel" if metadata.get("all_reduce_parallel") else "allreduce"
+    else:
+        return
+    yield metric, bandwidth, {
+        "runtime_scope": metadata.get("runtime_scope"),
+        "slice_topology": metadata.get("slice_topology"),
+        "topology": metadata.get("topology"),
+        "block_range": metadata.get("block_range"),
+        "tpu_count": metadata.get("tpu_count"),
+        "chiplet_count": metadata.get("chiplet_count"),
+        "bandwidth_accounting_unit": metadata.get("bandwidth_accounting_unit"),
+        "bandwidth_accounting_mode": metadata.get("bandwidth_accounting_mode"),
+        "bandwidth_scope": metrics.get("bandwidth_scope"),
+        "bandwidth_traffic_bytes": metrics.get("bandwidth_traffic_bytes"),
+        "bandwidth_formula": metadata.get("bandwidth_formula"),
+        "bisection_traffic_bytes": metadata.get("bisection_traffic_bytes"),
+        "ranks_per_group": metadata.get("bandwidth_formula_n_devices_per_group"),
+        "parallel_groups": metadata.get("bandwidth_formula_parallel_groups"),
+    }
+
+
+def is_self_copy_split_case(benchmark: str, execution_shape: str, case: TrafficCase) -> bool:
+    """Return whether a raw/p2p split case should run as local HBM copy."""
+    return (
+        benchmark in {"raw", "p2p"}
+        and execution_shape == "split_pairs"
+        and len(case.active_pairs) == 1
+        and case.active_pairs[0][0] == case.active_pairs[0][1]
+    )
+
 
 def run_ici(
     benchmark: str,
@@ -71,19 +215,24 @@ def run_ici(
     execution_shape: str,
     warmup: int,
     iteration: int,
-    result_dir: str,
-    dump_hlo: bool = False,
-    cleanup_trace: bool = False,
+    result_dir: str | None,
+    profile_artifacts: bool = False,
     xla_flag_profile: str | None = None,
     dump_hlo_source_dir: str | None = None,
     clear_hlo_source: bool = False,
+    ar_parallel: bool = False,
+    a2a_parallel: bool = False,
+    use_xprof_timing: bool = False,
+    runtime_scope: str = "slice",
+    block_range: str | None = None,
+    p2p_pair_mode: str = "all",
 ) -> dict[str, Any]:
     """Run ICI link performance benchmark.
 
     Phases per measurement:
       1. **Warmup** -- prime the TPU and let XLA compilation settle.
-      2. **Timed iterations** -- save xprof traces and parse MARKER durations.
-      3. **Dump HLO** -- copy XLA HLO dumps if ``dump_hlo=True``.
+      2. **Timed iterations** -- synchronized CPU timing by default; optional Xprof.
+      3. **Profile artifacts** -- retain Xprof traces and HLO dumps when enabled.
 
     Args:
         benchmark: benchmark subcommand name, e.g. "raw", "p2p",
@@ -97,12 +246,21 @@ def run_ici(
         warmup: number of warmup iterations.
         iteration: number of timed iterations.
         result_dir: base directory for results.
-        dump_hlo: if True, enable HLO dump collection.
+        profile_artifacts: retain Xprof traces and HLO dumps for analysis.
         xla_flag_profile: TPU/XLA flag profile selected by the CLI entrypoint.
-        dump_hlo_source_dir: temporary XLA dump directory configured before
-            JAX import.
+        dump_hlo_source_dir: persistent XLA dump directory configured before
+            JAX import as part of ``--profile`` output.
         clear_hlo_source: whether copied HLO dump files should be removed from
-            the temporary source directory.
+            a caller-provided source directory.
+        ar_parallel: for ``benchmark="ar"``, split the mesh by chiplet index
+            and run two all-reduce groups in parallel across TPU chips.
+        a2a_parallel: for ``benchmark="a2a"``, split the mesh by chiplet index
+            and run two all-to-all groups in parallel across TPU chips.
+        runtime_scope: ``local`` selects only devices addressable by this host;
+            ``slice`` selects the global devices from all distributed processes.
+        block_range: optional x,y,z half-open TPU chip range. Distributed JAX
+            still initializes every Slice host, while the benchmark mesh uses
+            only devices whose chip coordinates fall in this block.
 
     Returns:
         Dict with ``metadata``, ``metrics``, and ``output_directory``. Split
@@ -111,6 +269,10 @@ def run_ici(
     # --- Validate inputs ---------------------------------------------------
     if benchmark not in {"raw", "p2p", "p2p-rdma", "a2a", "ar"}:
         raise ValueError(f"Unknown benchmark: {benchmark}")
+    if p2p_pair_mode not in {"all", "neighbors"}:
+        raise ValueError(f"Unknown P2P pair mode: {p2p_pair_mode}")
+    if p2p_pair_mode != "all" and benchmark != "p2p":
+        raise ValueError("P2P pair selection is only supported by p2p")
     if benchmark == "raw" and traffic_matrix_str is None:
         raise ValueError("raw benchmark requires traffic_matrix_str")
     if (
@@ -122,6 +284,12 @@ def run_ici(
         raise ValueError(f"Unknown traffic execution shape: {execution_shape}")
     if benchmark in {"a2a", "ar"} and execution_shape != "single_matrix":
         raise ValueError(f"{benchmark} benchmark requires single_matrix execution")
+    if ar_parallel and benchmark != "ar":
+        raise ValueError("--parallel is only supported by ar benchmark")
+    if a2a_parallel and benchmark != "a2a":
+        raise ValueError("a2a_parallel is only supported by a2a benchmark")
+    if runtime_scope not in {"local", "slice"}:
+        raise ValueError(f"Unknown runtime scope: {runtime_scope}")
     parsed_data_size = parse_data_size(
         data_size,
         alignment_bytes=PAYLOAD_ROW_BYTES,
@@ -136,24 +304,65 @@ def run_ici(
     payload_rows_per_link = payload_rows
     data_size_label = parsed_data_size.label
     validate_non_negative("warmup", warmup)
+    if profile_artifacts and result_dir is None:
+        result_dir = default_profile_result_dir("ici")
     validate_positive("iteration", iteration)
 
-    topology, topology_source, tpu_chip_order = infer_tpu_topology()
+    slice_devices = list(
+        jax.local_devices() if runtime_scope == "local" else jax.devices()
+    )
+    slice_topology, topology_source, slice_tpu_chip_order = infer_tpu_topology(
+        slice_devices,
+        normalize_origin=runtime_scope == "local",
+    )
+    selected_block: TpuBlockRange = parse_tpu_block_range(
+        block_range,
+        slice_topology,
+    )
+    selected_chip_indices = [
+        index
+        for index, coord in enumerate(slice_tpu_chip_order)
+        if selected_block.contains(coord)
+    ]
+    if len(selected_chip_indices) != selected_block.chip_count:
+        raise ValueError(
+            f"--block-range {selected_block.spec} selected "
+            f"{len(selected_chip_indices)} TPU chips, expected "
+            f"{selected_block.chip_count}"
+        )
+    benchmark_devices = [
+        device
+        for chip_index in selected_chip_indices
+        for device in slice_devices[
+            chip_index * CHIPLETS_PER_TPU:(chip_index + 1) * CHIPLETS_PER_TPU
+        ]
+    ]
+    topology = selected_block.shape
+    tpu_chip_order = [
+        selected_block.normalize(slice_tpu_chip_order[index])
+        for index in selected_chip_indices
+    ]
     topology_str = format_topology(topology)
+    slice_topology_str = format_topology(slice_topology)
     n_tpus = topology[0] * topology[1] * topology[2]
     n_chiplets = n_tpus * CHIPLETS_PER_TPU
+    metrics_recorder_process_index = min(
+        int(device.process_index) for device in benchmark_devices
+    )
     all_to_all_chunk_rows = None
     all_to_all_chunk_bytes = None
     if benchmark == "a2a":
-        if payload_rows % n_chiplets != 0:
+        all_to_all_group_size = n_tpus if a2a_parallel else n_chiplets
+        if payload_rows % all_to_all_group_size != 0:
             raise ValueError(
                 "a2a --data-size is the pre-split payload bytes per chiplet "
                 "and must divide evenly into one all_to_all chunk per JAX "
                 f"device. Got payload_rows={payload_rows}, "
-                f"n_devices={n_chiplets}, row_bytes={PAYLOAD_ROW_BYTES}. "
-                f"Use a size divisible by {n_chiplets * PAYLOAD_ROW_BYTES} bytes."
+                f"n_devices_per_group={all_to_all_group_size}, "
+                f"row_bytes={PAYLOAD_ROW_BYTES}. Use a size divisible by "
+                f"{all_to_all_group_size * PAYLOAD_ROW_BYTES} bytes."
             )
-        all_to_all_chunk_rows = payload_rows // n_chiplets
+        all_to_all_chunk_rows = payload_rows // all_to_all_group_size
         all_to_all_chunk_bytes = all_to_all_chunk_rows * PAYLOAD_ROW_BYTES
 
     if benchmark == "ar":
@@ -172,8 +381,8 @@ def run_ici(
         )
     else:
         if traffic_matrix_str is None and benchmark == "p2p":
-            # p2p intentionally includes diagonal TPU entries so self and
-            # same-chip chiplet cases appear in the split-pair scan.
+            # Keep diagonal TPU entries so same-chip cross-chiplet links are
+            # measured; exact chiplet self-copies are removed after expansion.
             traffic_matrix_str = build_builtin_tpu_traffic_matrix_str(
                 n_tpus,
                 include_diagonal=True,
@@ -243,8 +452,9 @@ def run_ici(
         elif traffic_matrix_source == "builtin_all_tpu":
             logger.info(
                 "Built-in all-ones TPU traffic matrix is %dx%d with diagonal "
-                "entries enabled; p2p scans self, same-chip, and inter-TPU "
-                "chiplet cases. Aggregate ICI P2P bandwidth uses only "
+                "TPU entries enabled; p2p scans same-chip cross-chiplet and "
+                "inter-TPU links, excluding exact self-copies. Aggregate ICI "
+                "P2P bandwidth uses only "
                 "inter-TPU cases.",
                 n_tpus, n_tpus,
             )
@@ -258,9 +468,36 @@ def run_ici(
             )
 
         chiplet_matrix_np = expand_to_chiplet_level(tpu_matrix_np)
-        if benchmark == "p2p-rdma":
-            # Pallas remote DMA needs distinct source/destination chiplets.
-            # Keep same-TPU cross-chiplet links, but remove exact self links.
+        if benchmark == "p2p" and p2p_pair_mode == "neighbors":
+            chiplet_matrix_np[:] = 0
+            pairs = neighboring_p2p_chiplet_pairs(
+                [slice_tpu_chip_order[index] for index in selected_chip_indices],
+                slice_topology,
+            )
+            for src, dst in pairs:
+                chiplet_matrix_np[src, dst] = 1
+            tpu_traffic_matrix = [[0] * n_tpus for _ in range(n_tpus)]
+            for src, dst in pairs:
+                tpu_traffic_matrix[src // 2][dst // 2] = 1
+            traffic_matrix_source = "builtin_neighbor_tpu"
+            traffic_matrix_label = format_traffic_matrix_count_label(tpu_traffic_matrix)
+            logger.info(
+                "P2P neighbors: all %d directed die-to-die links; %d "
+                "directed adjacent-chip core0-to-core0 links; no self copies",
+                n_tpus * 2, len(pairs) - n_tpus * 2,
+            )
+        if benchmark == "a2a" and a2a_parallel:
+            for src_chiplet in range(n_chiplets):
+                for dst_chiplet in range(n_chiplets):
+                    if (
+                        src_chiplet % CHIPLETS_PER_TPU
+                        != dst_chiplet % CHIPLETS_PER_TPU
+                    ):
+                        chiplet_matrix_np[src_chiplet, dst_chiplet] = 0
+        if benchmark in {"p2p", "p2p-rdma"}:
+            # Self-copy measures local HBM rather than a communication link;
+            # Pallas remote DMA likewise requires distinct endpoints. Keep
+            # same-TPU cross-chiplet links but remove exact self links.
             np.fill_diagonal(chiplet_matrix_np, 0)
         chiplet_active_pairs = get_active_pairs(chiplet_matrix_np.tolist())
 
@@ -273,10 +510,12 @@ def run_ici(
         if benchmark == "a2a" else "payload_shape_per_link"
     )
     logger.info(
-        "  tpu_chip_topology=%s (%s)  tpu_chips=%d  chiplets=%d  "
+        "  slice_topology=%s  block_range=%s  "
+        "tpu_chip_topology=%s (%s)  tpu_chips=%d  chiplets=%d  "
         "data_size=%d bytes (%d float32 elements)  %s=(%d,%d,%d)  "
         "execution_shape=%s  traffic_units=%s  "
         "tpu_units=%d  chiplet_units=%d",
+        slice_topology_str, selected_block.spec,
         topology_str, topology_source, n_tpus, n_chiplets, data_size_bytes,
         data_size_elements, payload_shape_name, payload_rows, PAYLOAD_MID_DIM,
         PAYLOAD_LAST_DIM, execution_shape,
@@ -292,24 +531,36 @@ def run_ici(
 
     # --- Prepare output directories ----------------------------------------
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    block_label = selected_block.label
     run_name = (
-        f"{ts}_{benchmark}_topo{topology_str}_{traffic_matrix_label}_"
+        f"{ts}_{benchmark}_topo{topology_str}_block_{block_label}_"
+        f"{traffic_matrix_label}_"
         f"{execution_shape}_{data_size_label}"
     )
-    dirs = prepare_benchmark_dirs(result_dir, run_name, dump_hlo=dump_hlo)
+    dirs = prepare_benchmark_dirs(
+        result_dir,
+        run_name,
+        dump_hlo=profile_artifacts,
+        create_trace=profile_artifacts,
+    )
     out_dir = dirs.output_dir
     metrics_dir = dirs.metrics_dir
     trace_dir = dirs.trace_dir
     dump_hlo_dir = dirs.dump_hlo_dir
 
-    mesh = create_device_mesh(n_chiplets)
-    zero_crop_enabled = detect_zero_crop_available()
-    logger.info(
-        "ZeroCrop live-out consumer is %s for ICI collective outputs",
-        "enabled" if zero_crop_enabled else "disabled",
+    parallel_collective = (
+        (benchmark == "ar" and ar_parallel)
+        or (benchmark == "a2a" and a2a_parallel)
     )
+    mesh = (
+        create_parallel_chiplet_mesh(n_chiplets, benchmark_devices)
+        if parallel_collective
+        else create_device_mesh(n_chiplets, benchmark_devices)
+    )
+    # All kernels return their actual device result. Synchronizing that result
+    # keeps communication live without a separately timed ZeroCrop FFI call.
     traffic_matrix_role = {
-        "a2a": "inter_tpu_ici_bandwidth_accounting",
+        "a2a": "uniform_alltoall_one_way_bisection_accounting",
         "ar": "all_reduce_collective_group",
         "p2p-rdma": "pallas_remote_dma_link_scan",
     }.get(benchmark, "collective_execution_pattern")
@@ -326,8 +577,15 @@ def run_ici(
 
     metadata = {
         "benchmark": benchmark,
+        "p2p_pair_mode": p2p_pair_mode if benchmark == "p2p" else None,
+        "runtime_scope": runtime_scope,
+        "slice_topology": slice_topology_str,
         "topology": topology_str,
         "topology_source": topology_source,
+        "block_range": selected_block.spec,
+        "block_label": block_label,
+        "block_origin": list(selected_block.origin),
+        "block_shape": list(selected_block.shape),
         "tpu_chip_order": format_tpu_chip_order(tpu_chip_order),
         "traffic_matrix": traffic_matrix_str,
         "traffic_matrix_label": traffic_matrix_label,
@@ -336,12 +594,13 @@ def run_ici(
         "communication_primitive": communication_primitive,
         "trace_event_kernel_name_filter": trace_event_kernel_terms,
         "xla_flag_profile": xla_flag_profile,
-        "collective_output_consumer": (
-            "ZeroCrop" if zero_crop_enabled else "ordinary_live_out"
-        ),
-        "zero_crop_live_out_consumer": zero_crop_enabled,
+        "collective_output_consumer": "ordinary_live_out",
+        "zero_crop_live_out_consumer": False,
         "tpu_count": n_tpus,
         "chiplet_count": n_chiplets,
+        "all_reduce_parallel": bool(ar_parallel),
+        "all_to_all_parallel": bool(a2a_parallel),
+        "metrics_recorder_process_index": metrics_recorder_process_index,
         **parsed_data_size.metadata(),
         "data_size_semantics": (
             "pre_split_payload_bytes_per_chiplet"
@@ -359,7 +618,10 @@ def run_ici(
         "execution_shape": execution_shape,
         "warmup": warmup,
         "iteration": iteration,
-        "dump_hlo": dump_hlo,
+        "profile_artifacts": profile_artifacts,
+        "dump_hlo_dir": dump_hlo_dir,
+        "timing_mode": "xprof" if use_xprof_timing else "cpu",
+        "ar_parallel": ar_parallel if benchmark == "ar" else None,
     }
     if benchmark == "a2a":
         metadata.update({
@@ -378,9 +640,36 @@ def run_ici(
                 PAYLOAD_MID_DIM,
                 PAYLOAD_LAST_DIM,
             ],
+            "all_to_all_mesh_shape": (
+                [n_tpus, CHIPLETS_PER_TPU]
+                if a2a_parallel else [n_chiplets]
+            ),
+            "all_to_all_mesh_axes": (
+                ["d", "chiplet"] if a2a_parallel else ["d"]
+            ),
+            "all_to_all_collective_axis": "d",
+            "all_to_all_chiplet_axis_semantics": (
+                "replicated_parallel_groups" if a2a_parallel else "single_group"
+            ),
         })
 
     if benchmark == "ar":
+        if ar_parallel:
+            metadata.update({
+                "all_reduce_mesh_shape": [n_tpus, CHIPLETS_PER_TPU],
+                "all_reduce_mesh_axes": ["d", "chiplet"],
+                "all_reduce_collective_axis": "d",
+                "all_reduce_payload_partition_spec": "P('d', None, None)",
+                "all_reduce_chiplet_axis_semantics": "replicated_parallel_groups",
+            })
+        else:
+            metadata.update({
+                "all_reduce_mesh_shape": [n_chiplets],
+                "all_reduce_mesh_axes": ["d"],
+                "all_reduce_collective_axis": "d",
+                "all_reduce_payload_partition_spec": "P('d')",
+                "all_reduce_chiplet_axis_semantics": "single_group",
+            })
         traffic_cases = [
             TrafficCase(
                 label="all_reduce",
@@ -389,6 +678,12 @@ def run_ici(
                 metadata={
                     "participant_tpu_chips": n_tpus,
                     "participant_chiplets": n_chiplets,
+                    "parallel_group_count": (
+                        CHIPLETS_PER_TPU if ar_parallel else 1
+                    ),
+                    "parallel_group_size": (
+                        n_tpus if ar_parallel else n_chiplets
+                    ),
                 },
             )
         ]
@@ -400,13 +695,40 @@ def run_ici(
             topology=topology,
         )
     compiled_cache: dict[tuple[Any, ...], Any] = {}
+    # Keep only one send-buffer capacity across split pairs, rather than
+    # uploading GiB inputs for every link or retaining unbounded raw buffers.
+    ragged_buffers: list[Any] = [None]
+    ragged_buffer_shape: tuple[int, int] | None = None
     case_results = []
     all_durations = []
-    local_ids = local_chiplet_ids()
+    local_ids = local_chiplet_ids(benchmark_devices)
     unrecorded_case_count = 0
 
+    if runtime_scope == "slice" and jax.process_count() > 1 and not local_ids:
+        logger.info(
+            "This process owns no TPU chip in block %s; waiting while the "
+            "selected block is tested",
+            selected_block.spec,
+        )
+        for case_index in range(len(traffic_cases)):
+            _wait_at_process_barrier(f"ici_case_{case_index}_start")
+            _wait_for_case_completion(case_index)
+            _wait_at_process_barrier(f"ici_case_{case_index}_complete")
+        return {
+            "metadata": metadata,
+            "metrics": {
+                "traffic_cases": 0,
+                "timed_iterations_kept": 0,
+                "bandwidth_scope": "not_in_selected_block",
+            },
+            "per_case": [],
+            "output_directory": out_dir,
+        }
+
     try:
-        for case in traffic_cases:
+        for case_index, case in enumerate(traffic_cases):
+            if runtime_scope == "slice" and jax.process_count() > 1:
+                _wait_at_process_barrier(f"ici_case_{case_index}_start")
             logical_pair = case.metadata.get("logical_pair")
             if logical_pair:
                 logger.info(
@@ -421,47 +743,70 @@ def run_ici(
                 logger.info("=== traffic case: %s ===", case.label)
             traffic_jnp = None
             rdma_payload = None
+            all_reduce_payload = None
+            all_to_all_payload = None
             if benchmark == "ar":
                 # ar has one compiled executable for the whole collective.
                 cache_key = (
                     "ar",
                     n_chiplets,
                     payload_rows_per_link,
-                    zero_crop_enabled,
+                    ar_parallel,
                 )
                 if cache_key not in compiled_cache:
                     compiled_cache[cache_key] = compile_all_reduce_kernel(
                         mesh,
                         n_chiplets,
                         payload_rows_per_link,
-                        zero_crop_enabled,
+                        parallel=ar_parallel,
                     )
                 compiled_fn = compiled_cache[cache_key]
+                # The input is immutable and the kernel does not donate it.
+                # Preparing it for every invocation adds large host allocation
+                # and H2D skew between processes, which the first process then
+                # observes as collective wait time inside its CPU timer.
+                all_reduce_payload = make_axis_sharded_payload(
+                    mesh,
+                    n_chiplets,
+                    payload_rows_per_link,
+                    partition_spec=(
+                        P("d", None, None) if ar_parallel else P("d")
+                    ),
+                    row_shard_count=(n_tpus if ar_parallel else n_chiplets),
+                )
+                jax.block_until_ready(all_reduce_payload)
 
-                def data_generator():
-                    return (
-                        make_axis_sharded_payload(
-                            mesh,
-                            n_chiplets,
-                            payload_rows_per_link,
-                        ),
-                    )
+                def data_generator(payload=all_reduce_payload):
+                    return (payload,)
 
             elif benchmark == "a2a":
                 # a2a uses all_to_all directly; no traffic matrix argument is
                 # needed at runtime.
-                cache_key = ("a2a", n_chiplets, payload_rows, zero_crop_enabled)
+                all_to_all_group_size = n_tpus if a2a_parallel else n_chiplets
+                cache_key = (
+                    "a2a",
+                    n_chiplets,
+                    payload_rows,
+                    a2a_parallel,
+                )
                 if cache_key not in compiled_cache:
                     compiled_cache[cache_key] = compile_all_to_all_kernel(
                         mesh,
-                        n_chiplets,
+                        all_to_all_group_size,
                         payload_rows,
-                        zero_crop_enabled,
+                        parallel=a2a_parallel,
                     )
                 compiled_fn = compiled_cache[cache_key]
 
-                def data_generator():
-                    return ()
+                all_to_all_payload = make_axis_sharded_payload(
+                    mesh, n_chiplets, payload_rows,
+                    partition_spec=P("d", None, None) if a2a_parallel else P("d"),
+                    row_shard_count=all_to_all_group_size,
+                )
+                jax.block_until_ready(all_to_all_payload)
+
+                def data_generator(payload=all_to_all_payload):
+                    return (payload,)
             elif benchmark == "p2p-rdma":
                 if len(case.active_pairs) != 1:
                     raise ValueError(
@@ -474,7 +819,6 @@ def run_ici(
                     src_chiplet,
                     dst_chiplet,
                     payload_rows_per_link,
-                    zero_crop_enabled,
                 )
                 if cache_key not in compiled_cache:
                     compiled_cache[cache_key] = compile_remote_dma_p2p_kernel(
@@ -483,7 +827,30 @@ def run_ici(
                         payload_rows_per_link,
                         src_chiplet,
                         dst_chiplet,
-                        zero_crop_enabled,
+                    )
+                compiled_fn = compiled_cache[cache_key]
+                rdma_payload = make_axis_sharded_payload(
+                    mesh,
+                    n_chiplets,
+                    payload_rows_per_link,
+                )
+                jax.block_until_ready(rdma_payload)
+
+                def data_generator(payload=rdma_payload):
+                    return (payload,)
+            elif is_self_copy_split_case(benchmark, execution_shape, case):
+                src_chiplet, _ = case.active_pairs[0]
+                cache_key = (
+                    "self-copy",
+                    src_chiplet,
+                    payload_rows_per_link,
+                )
+                if cache_key not in compiled_cache:
+                    compiled_cache[cache_key] = compile_self_copy_kernel(
+                        mesh,
+                        n_chiplets,
+                        payload_rows_per_link,
+                        src_chiplet,
                     )
                 compiled_fn = compiled_cache[cache_key]
                 rdma_payload = make_axis_sharded_payload(
@@ -505,24 +872,30 @@ def run_ici(
                 )
                 max_send = max(1, int(tm_rows.sum(axis=1).max()))
                 max_recv = max(1, int(tm_rows.sum(axis=0).max()))
-                cache_key = ("ragged", max_send, max_recv, zero_crop_enabled)
+                cache_key = ("ragged", max_send, max_recv)
                 if cache_key not in compiled_cache:
                     compiled_cache[cache_key] = compile_traffic_matrix_kernel(
                         mesh,
                         n_chiplets,
                         max_send,
                         max_recv,
-                        zero_crop_enabled,
                     )
                 compiled_fn = compiled_cache[cache_key]
                 traffic_jnp = jnp.asarray(tm_rows, dtype=jnp.int32)
+                if ragged_buffer_shape != (max_send, max_recv):
+                    delete_device_object(ragged_buffers)
+                    ragged_buffers = [None]
+                    ragged_buffers[0] = make_axis_sharded_payload(mesh, n_chiplets, max_send)
+                    ragged_buffer_shape = (max_send, max_recv)
+                ragged_payload = ragged_buffers[0]
+                jax.block_until_ready((traffic_jnp, ragged_payload))
 
-                def data_generator(tm=traffic_jnp):
-                    return (tm,)
+                def data_generator(tm=traffic_jnp, payload=ragged_payload):
+                    return (tm, payload)
 
             try:
                 case_trace_dir = trace_dir
-                if len(traffic_cases) > 1:
+                if len(traffic_cases) > 1 and trace_dir:
                     # split-pair scans write one trace directory per link so a
                     # slow pair can be inspected without opening a huge trace.
                     case_trace_dir = os.path.join(trace_dir, case.label)
@@ -538,7 +911,11 @@ def run_ici(
                     ),
                     "case_active_link_semantics": (
                         "all_reduce_participants"
-                        if benchmark == "ar" else "p2p_links"
+                        if benchmark == "ar"
+                        else (
+                            "all_to_all_directed_inter_tpu_pairs"
+                            if benchmark == "a2a" else "p2p_links"
+                        )
                     ),
                 }
                 src_tpu_id = case.metadata.get("src_tpu_id")
@@ -579,10 +956,25 @@ def run_ici(
                     data_size_bytes=data_size_bytes,
                     n_chiplets=n_chiplets,
                     n_tpus=n_tpus,
+                    ar_parallel=ar_parallel,
+                    a2a_parallel=a2a_parallel,
                 )
                 case_metadata.update(bandwidth_metadata)
+                if is_self_copy_split_case(benchmark, execution_shape, case):
+                    case_metadata.update({
+                        "communication_primitive": "jax_elementwise_add",
+                        "traffic_matrix_role": "self_hbm_read_write",
+                        "pair_scope": "self_chiplet_hbm_read_write",
+                        "bandwidth_formula": "data_size",
+                        "bandwidth_formula_scope": (
+                            "single_chiplet_hbm_read_write_effective"
+                        ),
+                    })
 
-                test_name = f"ici_{benchmark}_{case.label}_topo{topology_str}"
+                test_name = (
+                    f"ici_{benchmark}_{case.label}_topo{topology_str}_"
+                    f"block_{block_label}"
+                )
                 local_endpoint_role = split_case_local_endpoint_role(
                     case,
                     local_ids,
@@ -591,17 +983,21 @@ def run_ici(
                     benchmark in {"p2p", "p2p-rdma"}
                     and execution_shape == "split_pairs"
                 ):
-                    record_case = should_execute_split_case(case, local_ids)
+                    record_case = should_record_split_case(case, local_ids)
                 else:
                     record_case = (
-                        execution_shape != "split_pairs"
-                        or should_record_split_case(case, local_ids)
+                        jax.process_index() == metrics_recorder_process_index
                     )
                 if record_case:
                     trace_event_source_contains = (
                         "/ici/kernels.py" if benchmark == "p2p-rdma" else None
                     )
-                    trace_event_kernel_name_contains = trace_event_kernel_terms
+                    if is_self_copy_split_case(benchmark, execution_shape, case):
+                        trace_event_kernel_name_contains = None
+                    else:
+                        trace_event_kernel_name_contains = (
+                            trace_event_kernel_terms
+                        )
                     case_result = _run_benchmark_phases(
                         compiled_fn=compiled_fn,
                         data_generator=data_generator,
@@ -626,11 +1022,12 @@ def run_ici(
                                 local_endpoint_role
                             ),
                         },
-                        cleanup_trace=cleanup_trace,
                         trace_event_source_contains=trace_event_source_contains,
                         trace_event_kernel_name_contains=(
                             trace_event_kernel_name_contains
                         ),
+                        use_xprof_timing=use_xprof_timing,
+                        profile_artifacts=profile_artifacts,
                     )
                 else:
                     unrecorded_case_count += 1
@@ -644,7 +1041,14 @@ def run_ici(
             finally:
                 delete_device_object(traffic_jnp)
                 delete_device_object(rdma_payload)
+                delete_device_object(all_reduce_payload)
+                delete_device_object(all_to_all_payload)
                 gc.collect()
+
+            if runtime_scope == "slice" and jax.process_count() > 1:
+                if jax.process_index() == metrics_recorder_process_index:
+                    _signal_case_completion(case_index)
+                _wait_at_process_barrier(f"ici_case_{case_index}_complete")
 
             if case_result is not None:
                 case_result["traffic_case"] = format_traffic_case(case)
@@ -652,21 +1056,17 @@ def run_ici(
                 all_durations.extend(case_result["durations_ms"])
 
         collect_hlo_dumps_if_requested(
-            dump_hlo,
+            profile_artifacts,
             dump_hlo_source_dir,
             dump_hlo_dir,
-            f"ici_{benchmark}_{execution_shape}_topo{topology_str}_kernel",
+            f"ici_{benchmark}_{execution_shape}_topo{topology_str}_"
+            f"block_{block_label}_kernel",
             clear_source=clear_hlo_source,
         )
 
-        if len(traffic_cases) == 1:
-            results = case_results[0]
-            results["output_directory"] = out_dir
-            return results
-
         if not case_results:
             logger.info(
-                "No split-pair metrics are owned by process %d; "
+                "No benchmark metrics are owned by process %d; "
                 "skipping aggregate metrics on this host",
                 jax.process_index(),
             )
@@ -682,6 +1082,11 @@ def run_ici(
                 "per_case": [],
                 "output_directory": out_dir,
             }
+
+        if len(traffic_cases) == 1:
+            results = case_results[0]
+            results["output_directory"] = out_dir
+            return results
 
         agg_stats = MetricsStatistics(all_durations, "duration", unit="ms")
         agg_metrics = agg_stats.serialize()
@@ -736,7 +1141,10 @@ def run_ici(
         agg_metrics["bandwidth_traffic_bytes"] = data_size_bytes
         agg_metrics["bandwidth_scope"] = bandwidth_scope
         agg_metrics["bandwidth_aggregation"] = bandwidth_aggregation
-        agg_metrics["timing_source"] = "xprof_marker_device_duration"
+        agg_metrics["timing_source"] = (
+            "xprof_marker_device_duration"
+            if use_xprof_timing else "cpu_wall_clock_with_block_until_ready"
+        )
         agg_metrics["avg_bandwidth_GBps"] = round(agg_bw, 4)
         if execution_shape == "split_pairs":
             agg_metrics["split_pair_bandwidth_grouping"] = (
@@ -780,6 +1188,7 @@ def run_ici(
             "output_directory": out_dir,
         }
     finally:
+        delete_device_object(ragged_buffers)
         release_compiled_cache(compiled_cache)
 
 
@@ -787,7 +1196,6 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
     """Return a compact JSON-safe summary for terminal output."""
     metadata = results.get("metadata", {})
     metrics = results.get("metrics", {})
-    output_directory = results.get("output_directory")
 
     duration_ms = {
         key.removeprefix("duration_").removesuffix("_ms"): value
@@ -799,8 +1207,12 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "benchmark": metadata.get("benchmark"),
         "topology": {
+            "slice_topology": metadata.get("slice_topology"),
             "tpu_chip_topology": metadata.get("topology"),
             "source": metadata.get("topology_source"),
+            "block_range": metadata.get("block_range"),
+            "block_origin": metadata.get("block_origin"),
+            "block_shape": metadata.get("block_shape"),
             "tpu_chips": metadata.get("tpu_count"),
             "chiplets": metadata.get("chiplet_count"),
         },
@@ -852,22 +1264,6 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
             "timing_source": metrics.get("timing_source"),
             "trace_event_selection": metrics.get("trace_event_selection"),
             "total_traffic_bytes": metrics.get("total_traffic_bytes"),
-        },
-        "output": {
-            "run_dir": output_directory,
-            "metrics_dir": (
-                os.path.join(output_directory, "metrics")
-                if output_directory else None
-            ),
-            "trace_dir": (
-                os.path.join(output_directory, "trace")
-                if output_directory else None
-            ),
-            "dump_hlo_enabled": metadata.get("dump_hlo"),
-            "dump_hlo_dir": (
-                os.path.join(output_directory, "dump_hlo")
-                if output_directory and metadata.get("dump_hlo") else None
-            ),
         },
     }
 

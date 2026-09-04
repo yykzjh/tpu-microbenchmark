@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import atexit
+from datetime import datetime
 import logging
 import os
 import re
-import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -17,23 +16,57 @@ from typing import Any
 class DumpHloConfig:
     """Resolved XLA HLO dump configuration."""
 
-    temp_dir: str | None
-    owned: bool
-
-    def cleanup(self) -> None:
-        """Remove the owned temporary dump directory."""
-        if self.temp_dir and self.owned:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+    dump_dir: str | None
 
 
 @dataclass(frozen=True)
 class BenchmarkDirs:
     """Common output directories for one benchmark run."""
 
-    output_dir: str
+    output_dir: str | None
     metrics_dir: str | None
     trace_dir: str | None
     dump_hlo_dir: str | None
+
+
+TPU_LOG_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
+TPU_TEMP_ROOT = os.path.join(TPU_LOG_ROOT, ".tmp")
+TPU_PROFILE_HLO_DIR_ENV = "COMMPILOT_PROFILE_HLO_DIR"
+
+_DEFAULT_PROFILE_TESTCASE_BY_PREFIX = {
+    "gemm": "gemm",
+    "ici": "ici",
+    "hbm": "tpubandwidth",
+    "vmem": "tpubandwidth",
+}
+
+
+def _resolve_output_path(path: str) -> str:
+    """Return a normalized absolute output path without restricting its root."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def default_profile_result_dir(testcase: str) -> str:
+    """Return the standard retained-artifact root for one testcase."""
+    return os.path.join(TPU_LOG_ROOT, testcase, "profile")
+
+
+def benchmark_temporary_directory(prefix: str):
+    """Create an auto-cleaned timing workspace below the repository ``logs/.tmp`` directory."""
+    os.makedirs(TPU_TEMP_ROOT, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=TPU_TEMP_ROOT)
+
+
+def _argv_option_value(argv: list[str], option: str) -> str | None:
+    """Read a simple ``--option value`` or ``--option=value`` CLI argument."""
+    for index, value in enumerate(argv):
+        if value.startswith(f"{option}="):
+            return value.split("=", 1)[1]
+        if value == option:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{option} requires a value")
+            return argv[index + 1]
+    return None
 
 
 TPU_BENCHMARK_ENV_PROFILES: dict[str, dict[str, Any]] = {
@@ -42,7 +75,8 @@ TPU_BENCHMARK_ENV_PROFILES: dict[str, dict[str, Any]] = {
     # convolution and may need to fuse downcast/layout conversion into inputs.
     "gemm": {
         "libtpu_flags": [
-            "--xla_tpu_enable_async_collective_fusion=true",
+            # Newer libtpu rejects continuation fusion on TPU7x (non-Viperlite).
+            "--xla_tpu_enable_async_collective_fusion=false",
             "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true",
             "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
             "--xla_tpu_overlap_compute_collective_tc=true",
@@ -107,8 +141,6 @@ TPU_BENCHMARK_ENV_PROFILES: dict[str, dict[str, Any]] = {
             "--xla_tpu_scoped_vmem_limit_kib=65536",
             "--xla_jf_bounds_check=false",
             "--xla_tpu_dvfs_p_state=7",
-            "--xla_tpu_enable_llo_profiling=true",
-            "--xla_jf_profile_cheap_ops=true",
         ],
     },
     "vmem": {
@@ -116,8 +148,6 @@ TPU_BENCHMARK_ENV_PROFILES: dict[str, dict[str, Any]] = {
             "--xla_tpu_scoped_vmem_limit_kib=65536",
             "--xla_jf_bounds_check=false",
             "--xla_tpu_dvfs_p_state=7",
-            "--xla_tpu_enable_llo_profiling=true",
-            "--xla_jf_profile_cheap_ops=true",
         ],
     },
 }
@@ -161,44 +191,76 @@ def configure_tpu_benchmark_env(profile: str) -> None:
 def configure_dump_hlo_from_argv(
     prefix: str,
     argv: list[str] | None = None,
-    flag: str = "--dump-hlo",
+    flags: tuple[str, ...] = ("--profile", "--dump-hlo"),
 ) -> DumpHloConfig:
-    """Configure ``XLA_FLAGS=--xla_dump_to`` before JAX is imported."""
+    """Configure a persistent profile HLO directory before JAX is imported."""
     argv = sys.argv if argv is None else argv
-    if flag not in argv:
-        return DumpHloConfig(temp_dir=None, owned=False)
+    if not any(flag in argv for flag in flags):
+        os.environ.pop(TPU_PROFILE_HLO_DIR_ENV, None)
+        return DumpHloConfig(dump_dir=None)
 
     existing_xla_flags = os.environ.get("XLA_FLAGS", "")
     existing_dump_dir = re.search(r"(?:^|\s)--xla_dump_to=(\S+)", existing_xla_flags)
     if existing_dump_dir:
-        return DumpHloConfig(temp_dir=existing_dump_dir.group(1), owned=False)
+        dump_dir = _resolve_output_path(existing_dump_dir.group(1))
+        os.makedirs(dump_dir, exist_ok=True)
+        os.environ[TPU_PROFILE_HLO_DIR_ENV] = dump_dir
+        return DumpHloConfig(dump_dir=dump_dir)
 
-    temp_dir = tempfile.mkdtemp(prefix=f"{prefix}_dump_hlo_")
-    config = DumpHloConfig(temp_dir=temp_dir, owned=True)
-    atexit.register(config.cleanup)
+    result_dir_arg = _argv_option_value(list(argv), "--result-dir")
+    if result_dir_arg:
+        profile_root = _resolve_output_path(result_dir_arg)
+    else:
+        testcase = _DEFAULT_PROFILE_TESTCASE_BY_PREFIX.get(prefix, prefix)
+        profile_root = default_profile_result_dir(testcase)
 
-    dump_hlo_flag = f"--xla_dump_to={temp_dir}"
+    session_name = (
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{prefix}_profile_p{os.getpid()}"
+    )
+    dump_dir = os.path.join(profile_root, "hlo", session_name)
+    os.makedirs(dump_dir, exist_ok=True)
+    os.environ[TPU_PROFILE_HLO_DIR_ENV] = dump_dir
+
+    dump_hlo_flag = f"--xla_dump_to={dump_dir}"
     if existing_xla_flags:
         os.environ["XLA_FLAGS"] = f"{existing_xla_flags} {dump_hlo_flag}"
     else:
         os.environ["XLA_FLAGS"] = dump_hlo_flag
-    return config
+    return DumpHloConfig(dump_dir=dump_dir)
 
 
 def prepare_benchmark_dirs(
-    result_dir: str,
+    result_dir: str | None,
     run_name: str,
     dump_hlo: bool = False,
     create_metrics: bool = True,
     create_trace: bool = True,
 ) -> BenchmarkDirs:
     """Create common output directories for one benchmark run."""
+    if result_dir is None:
+        if dump_hlo:
+            raise ValueError("--profile requires --result-dir")
+        return BenchmarkDirs(
+            output_dir=None,
+            metrics_dir=None,
+            trace_dir=None,
+            dump_hlo_dir=None,
+        )
+
+    result_dir = _resolve_output_path(result_dir)
     output_dir = os.path.join(result_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
     metrics_dir = os.path.join(output_dir, "metrics") if create_metrics else None
-    trace_dir = os.path.join(output_dir, "trace") if create_trace else None
-    dump_hlo_dir = os.path.join(output_dir, "dump_hlo") if dump_hlo else None
+    trace_dir = (
+        os.path.join(result_dir, "xprof", run_name)
+        if create_trace else None
+    )
+    dump_hlo_dir = (
+        os.environ.get(TPU_PROFILE_HLO_DIR_ENV)
+        or os.path.join(result_dir, "hlo", run_name)
+    ) if dump_hlo else None
 
     for directory in (metrics_dir, trace_dir, dump_hlo_dir):
         if directory:
@@ -224,21 +286,35 @@ def validate_non_negative(name: str, value: int | float) -> None:
         raise ValueError(f"{name} must be non-negative, got {value}")
 
 
-def initialize_jax_distributed(logger) -> bool:
-    """Initialize JAX distributed runtime with consistent logging."""
+def initialize_jax_distributed(
+    logger,
+    *,
+    coordinator_address: str,
+    process_count: int,
+    process_id: int,
+) -> None:
+    """Initialize one explicitly defined JAX distributed process group."""
     import jax
 
     try:
-        jax.distributed.initialize()
-        logger.info("JAX distributed initialized successfully")
-        return True
-    except Exception as exc:
-        logger.warning("Distributed initialization failed: %s", exc)
-        logger.warning(
-            "If running multi-host, check COORDINATOR_ADDRESS, "
-            "JAX_PROCESS_COUNT, and JAX_PROCESS_ID environment variables."
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=process_count,
+            process_id=process_id,
         )
-        return False
+        logger.info(
+            "JAX distributed initialized successfully: coordinator=%s "
+            "process_count=%d process_id=%d",
+            coordinator_address,
+            process_count,
+            process_id,
+        )
+    except Exception as exc:
+        logger.error("JAX distributed initialization failed: %s", exc)
+        raise RuntimeError(
+            "JAX distributed initialization failed; check the coordinator, "
+            "process count, process id, and connectivity between all selected hosts"
+        ) from exc
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -249,9 +325,31 @@ def configure_logging(level: int = logging.INFO) -> None:
     )
 
 
-def initialize_jax_runtime(logger) -> dict[str, Any]:
+def initialize_jax_runtime(
+    logger,
+    *,
+    coordinator_address: str,
+    process_count: int,
+    process_id: int,
+) -> dict[str, Any]:
     """Initialize JAX distributed runtime and log the device view."""
-    initialize_jax_distributed(logger)
+    initialize_jax_distributed(
+        logger,
+        coordinator_address=coordinator_address,
+        process_count=process_count,
+        process_id=process_id,
+    )
+    return log_jax_runtime_view(logger)
+
+
+def initialize_local_jax_runtime(logger) -> dict[str, Any]:
+    """Log the local JAX device view without joining a distributed runtime.
+
+    GEMM and TPUbandwidth are host-local benchmarks.  They must remain usable
+    when a multi-host job exports coordinator variables for other testcases,
+    so these entrypoints deliberately avoid ``jax.distributed.initialize``.
+    """
+    logger.info("Using host-local JAX runtime; distributed initialization is disabled")
     return log_jax_runtime_view(logger)
 
 

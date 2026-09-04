@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 import jax
@@ -15,10 +17,12 @@ from ici.constants import (
     PAYLOAD_LAST_DIM,
     PAYLOAD_MID_DIM,
 )
-from ici.zero_crop import maybe_zero_crop
 from utils.profiling import MARKER
 
-def create_device_mesh(num_devices: int) -> Mesh:
+def create_device_mesh(
+    num_devices: int,
+    devices: list[Any] | None = None,
+) -> Mesh:
     """Create 1-D JAX device mesh over all devices.
 
     A flat 1-D mesh ``("d",)`` is used because the communication pattern
@@ -29,52 +33,74 @@ def create_device_mesh(num_devices: int) -> Mesh:
     this mesh. :func:`infer_tpu_topology` validates that those consecutive
     device pairs expose the same TPU chip coordinates.
     """
-    devices = jax.devices()
-    if len(devices) < num_devices:
+    selected_devices = list(jax.devices() if devices is None else devices)
+    if len(selected_devices) < num_devices:
         raise ValueError(
-            f"Need {num_devices} devices, only {len(devices)} available. "
+            f"Need {num_devices} devices, only {len(selected_devices)} available. "
             f"Check that jax.distributed.initialize() succeeded on all hosts."
         )
-    return Mesh(np.asarray(devices[:num_devices]), ("d",))
+    return Mesh(np.asarray(selected_devices[:num_devices]), ("d",))
+
+
+def create_parallel_chiplet_mesh(
+    num_devices: int,
+    devices: list[Any] | None = None,
+) -> Mesh:
+    """Create a 2-D mesh that separates the two chiplets on each TPU chip.
+
+    The mesh is created through JAX's topology-aware mesh builder instead of
+    manually reshaping ``jax.devices()``. This gives the runtime a better chance
+    to place the intra-chip chiplet dimension on the last mesh axis. A
+    collective over axis ``"d"`` therefore creates two parallel replica groups,
+    one per chiplet coordinate on the ``"chiplet"`` axis.
+    """
+    if num_devices % 2 != 0:
+        raise ValueError(
+            f"Parallel chiplet mesh requires an even device count, got {num_devices}"
+        )
+    selected_devices = list(jax.devices() if devices is None else devices)
+    if len(selected_devices) < num_devices:
+        raise ValueError(
+            f"Need {num_devices} devices, only {len(selected_devices)} available. "
+            f"Check that jax.distributed.initialize() succeeded on all hosts."
+        )
+    return jax.make_mesh(
+        (num_devices // 2, 2),
+        ("d", "chiplet"),
+        devices=selected_devices[:num_devices],
+    )
 
 
 def make_axis_sharded_payload(
     mesh: Mesh,
     num_devices: int,
     payload_rows_per_link: int,
+    partition_spec: P | None = None,
+    row_shard_count: int | None = None,
 ) -> jax.Array:
-    """Create one sharded payload chunk per device for all-reduce input."""
-    sharding = NamedSharding(mesh, P("d"))
-    # Global axis 0 is partitioned by mesh axis d. Each device receives exactly
-    # payload_rows_per_link rows, which is the AllReduce payload per chiplet.
-    global_shape = (
-        payload_rows_per_link * num_devices,
-        PAYLOAD_MID_DIM,
-        PAYLOAD_LAST_DIM,
-    )
+    """Prepare immutable payloads on TPU, outside the measured executable.
 
-    def data_callback(index):
-        axis0 = index[0] if isinstance(index, tuple) else index
-        if not isinstance(axis0, slice):
-            raise ValueError(f"Unexpected all-reduce payload shard index: {index}")
-        start = axis0.start or 0
-        stop = axis0.stop or global_shape[0]
-        shard_rows = stop - start
-        if shard_rows <= 0:
-            raise ValueError(f"Invalid all-reduce payload shard index: {index}")
-        device_index = start // payload_rows_per_link
-        # Fill each shard with a different value so a debugger can distinguish
-        # participant shards in traces or dumps without adding extra reductions
-        # to the benchmark path.
-        return (
-            np.ones(
-                (shard_rows, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
-                dtype=np.float32,
-            )
-            * (device_index + 1)
+    Materializing every local GiB shard in NumPy adds host allocation and H2D
+    upload to each case. A separate device initializer creates the same values
+    once; the collective still receives a real dynamic input, not a constant
+    that the compiler can fold into its measured executable.
+    """
+    partition_spec = partition_spec or P("d")
+    row_shard_count = row_shard_count or num_devices
+    if row_shard_count != mesh.shape["d"]:
+        raise ValueError("Payload row shard count must match the mesh d axis")
+
+    def initialize():
+        return jnp.full(
+            (payload_rows_per_link, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
+            jax.lax.axis_index("d") + 1,
+            dtype=jnp.float32,
         )
 
-    return jax.make_array_from_callback(global_shape, sharding, data_callback)
+    return jax.jit(jax.shard_map(
+        initialize, mesh=mesh, in_specs=(), out_specs=partition_spec,
+        check_vma=False,
+    ))()
 
 
 def compile_traffic_matrix_kernel(
@@ -82,7 +108,6 @@ def compile_traffic_matrix_kernel(
     num_devices: int,
     max_send_rows: int,
     max_recv_rows: int,
-    use_zero_crop: bool,
 ):
     """Compile a ragged_all_to_all P2P kernel.
 
@@ -99,10 +124,10 @@ def compile_traffic_matrix_kernel(
         max_recv_rows: max total recv rows across any single device
             (compile-time constant, determines output buffer shape).
     Returns:
-        A compiled function: ``(traffic_matrix,) -> received buffers``.
+        A compiled function: ``(traffic_matrix, payload) -> buffers``.
     """
 
-    def kernel(traffic_matrix):
+    def kernel(traffic_matrix, payload):
         me = jax.lax.axis_index("d")
 
         # --- send/recv sizes (payload rows, NOT bytes) ---
@@ -135,22 +160,16 @@ def compile_traffic_matrix_kernel(
         prefix_by_src = jnp.cumsum(traffic_matrix, axis=0) - traffic_matrix
         output_offsets = prefix_by_src[me, :]
 
-        payload = (
-            jnp.ones(
-                (max_send_rows, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
-                dtype=jnp.float32,
-            )
-            * (me + 1)
-        )
+        # Ragged transfers leave non-received regions unchanged. Keep the
+        # zero initialization local to this executable: passing a large
+        # external output buffer introduces TPU copies even with donation.
         output = jnp.zeros(
-            (max_recv_rows, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
-            dtype=jnp.float32,
+            (max_recv_rows, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM), jnp.float32,
         )
 
         with jax.named_scope(MARKER):
-            # The MARKER wraps only the collective primitive. Input payload
-            # creation above is inside the compiled function but outside the
-            # named scope, so xprof extraction focuses on communication.
+            # Return the real output: a live-out is sufficient to keep the
+            # collective, without an additional full-buffer FFI consumer.
             result = jax.lax.ragged_all_to_all(
                 operand=payload,
                 output=output,
@@ -160,7 +179,6 @@ def compile_traffic_matrix_kernel(
                 recv_sizes=recv_sizes,
                 axis_name="d",
             )
-            result = maybe_zero_crop(result, use_zero_crop)
 
         return result
 
@@ -169,12 +187,82 @@ def compile_traffic_matrix_kernel(
             jax.shard_map(
                 kernel,
                 mesh=mesh,
-                in_specs=P(),
+                in_specs=(P(), P("d")),
                 out_specs=P("d"),
                 check_vma=False,
-            )
+            ),
         )
-        .lower(jnp.zeros((num_devices, num_devices), dtype=jnp.int32))
+        .lower(
+            jax.ShapeDtypeStruct((num_devices, num_devices), jnp.int32),
+            jax.ShapeDtypeStruct(
+                (max_send_rows * num_devices, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
+                jnp.float32, sharding=NamedSharding(mesh, P("d")),
+            ),
+        )
+        .compile()
+    )
+
+
+def compile_self_copy_kernel(
+    mesh: Mesh,
+    num_devices: int,
+    payload_rows_per_link: int,
+    target_chiplet: int,
+):
+    """Compile a local JAX elementwise kernel for one self P2P chiplet case.
+
+    ``p2p`` self pairs are not real ICI transfers. They model a local copy from
+    one HBM-backed array location to another on the same chiplet. Plain
+    ``Array.copy()`` can lower to an identity in XLA, so use ``x + 1.0`` to
+    force a local read/write kernel while preserving the same data-size
+    bandwidth numerator as the former self-copy path.
+    """
+    if target_chiplet < 0 or target_chiplet >= num_devices:
+        raise ValueError(
+            f"target_chiplet must be in [0, {num_devices}), got "
+            f"{target_chiplet}"
+        )
+
+    local_payload_shape = (
+        payload_rows_per_link,
+        PAYLOAD_MID_DIM,
+        PAYLOAD_LAST_DIM,
+    )
+    global_payload_shape = (
+        payload_rows_per_link * num_devices,
+        PAYLOAD_MID_DIM,
+        PAYLOAD_LAST_DIM,
+    )
+
+    def kernel(payload):
+        def shard_fn(local_payload):
+            me = jax.lax.axis_index("d")
+
+            def copy_like_read_write(x):
+                return x + jnp.float32(1.0)
+
+            def keep_local(x):
+                return x
+
+            with jax.named_scope(MARKER):
+                return jax.lax.cond(
+                    me == target_chiplet,
+                    copy_like_read_write,
+                    keep_local,
+                    local_payload,
+                )
+
+        return jax.shard_map(
+            shard_fn,
+            mesh=mesh,
+            in_specs=P("d"),
+            out_specs=P("d"),
+            check_vma=False,
+        )(payload)
+
+    return (
+        jax.jit(kernel)
+        .lower(jax.ShapeDtypeStruct(global_payload_shape, jnp.float32))
         .compile()
     )
 
@@ -185,7 +273,6 @@ def compile_remote_dma_p2p_kernel(
     payload_rows_per_link: int,
     src_chiplet: int,
     dst_chiplet: int,
-    use_zero_crop: bool,
 ):
     """Compile a directed Pallas remote-DMA P2P kernel for one chiplet pair.
 
@@ -244,7 +331,6 @@ def compile_remote_dma_p2p_kernel(
         def shard_fn(local_payload):
             with jax.named_scope(MARKER):
                 result = rdma_call(local_payload)
-                result = maybe_zero_crop(result, use_zero_crop)
             return result
 
         return jax.shard_map(
@@ -266,13 +352,14 @@ def compile_all_to_all_kernel(
     mesh: Mesh,
     num_devices: int,
     payload_rows_per_chiplet: int,
-    use_zero_crop: bool,
+    parallel: bool = False,
 ):
     """Compile a dense JAX all_to_all kernel for the built-in a2a benchmark.
 
     Each device owns one pre-split payload of ``payload_rows_per_chiplet`` rows.
     ``jax.lax.all_to_all(..., tiled=True)`` splits that axis into equal chunks
-    and exchanges one chunk with every device in the mesh.
+    and exchanges one chunk with every device on mesh axis ``"d"``. In parallel
+    mode the two chiplet coordinates form independent, concurrent groups.
     """
     if payload_rows_per_chiplet % num_devices != 0:
         raise ValueError(
@@ -280,21 +367,12 @@ def compile_all_to_all_kernel(
             f"JAX device: payload_rows={payload_rows_per_chiplet}, "
             f"n_devices={num_devices}"
         )
-    local_rows = payload_rows_per_chiplet
+    output_spec = P("d", None, None) if parallel else P("d")
 
-    def kernel():
-        me = jax.lax.axis_index("d")
+    def kernel(payload):
         # all_to_all with tiled=True splits each chiplet's pre-split payload
         # into num_devices equal chunks. Only the chunks targeting other TPU
         # chips are counted in the ICI bandwidth numerator.
-        payload = (
-            jnp.ones(
-                (local_rows, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
-                dtype=jnp.float32,
-            )
-            * (me + 1)
-        )
-
         with jax.named_scope(MARKER):
             result = jax.lax.all_to_all(
                 payload,
@@ -303,7 +381,6 @@ def compile_all_to_all_kernel(
                 concat_axis=0,
                 tiled=True,
             )
-            result = maybe_zero_crop(result, use_zero_crop)
 
         return result
 
@@ -312,12 +389,16 @@ def compile_all_to_all_kernel(
             jax.shard_map(
                 kernel,
                 mesh=mesh,
-                in_specs=(),
-                out_specs=P("d"),
+                in_specs=output_spec,
+                out_specs=output_spec,
                 check_vma=False,
             )
         )
-        .lower()
+        .lower(jax.ShapeDtypeStruct(
+            (payload_rows_per_chiplet * num_devices, PAYLOAD_MID_DIM, PAYLOAD_LAST_DIM),
+            jnp.float32,
+            sharding=NamedSharding(mesh, output_spec),
+        ))
         .compile()
     )
 
@@ -326,16 +407,28 @@ def compile_all_reduce_kernel(
     mesh: Mesh,
     num_devices: int,
     payload_rows_per_link: int,
-    use_zero_crop: bool,
+    parallel: bool = False,
 ):
     """Compile a JAX psum kernel for the built-in all-reduce benchmark."""
+    partition_spec = P("d", None, None) if parallel else P("d")
+    collective_axis = "d"
+    row_shard_count = num_devices // 2 if parallel else num_devices
+    input_shape = (
+        payload_rows_per_link * row_shard_count,
+        PAYLOAD_MID_DIM,
+        PAYLOAD_LAST_DIM,
+    )
+    input_spec = jax.ShapeDtypeStruct(
+        input_shape,
+        jnp.float32,
+        sharding=NamedSharding(mesh, partition_spec),
+    )
 
     def kernel(payload):
         with jax.named_scope(MARKER):
             # psum is the JAX collective used as AllReduce here; bandwidth is
             # reported with the standard busbw-style traffic factor.
-            result = jax.lax.psum(payload, axis_name="d")
-            result = maybe_zero_crop(result, use_zero_crop)
+            result = jax.lax.psum(payload, axis_name=collective_axis)
 
         return result
 
@@ -344,18 +437,11 @@ def compile_all_reduce_kernel(
             jax.shard_map(
                 kernel,
                 mesh=mesh,
-                in_specs=P("d"),
-                out_specs=P("d"),
+                in_specs=partition_spec,
+                out_specs=partition_spec,
                 check_vma=False,
             )
         )
-        .lower(jax.ShapeDtypeStruct(
-            (
-                payload_rows_per_link * num_devices,
-                PAYLOAD_MID_DIM,
-                PAYLOAD_LAST_DIM,
-            ),
-            jnp.float32,
-        ))
+        .lower(input_spec)
         .compile()
     )

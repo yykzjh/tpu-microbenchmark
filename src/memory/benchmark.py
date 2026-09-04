@@ -7,12 +7,18 @@ from typing import Any, Callable
 import jax
 
 from memory.options import summarize_per_device_bandwidth, validate_memory_mode
-from utils.metrics import MetricsStatistics, compute_bandwidth_GBps, write_jsonl_metrics
+from utils.metrics import (
+    MetricsStatistics,
+    compute_bandwidth_GBps,
+    emit_log_metric,
+    write_jsonl_metrics,
+)
 from utils.profiling import (
     TraceTimingConfig,
     collect_hlo_dumps_if_requested,
     delete_device_object,
     run_profiled_iterations,
+    run_synchronized_iterations,
 )
 from utils.runtime import (
     get_local_devices_or_raise,
@@ -27,10 +33,10 @@ def run_memory_benchmark_across_devices(
     *,
     benchmark: str,
     mode: str,
-    result_dir: str,
+    result_dir: str | None,
     run_name_builder: Callable[[int], str],
     metadata_builder: Callable[[int], dict[str, Any]],
-    per_device_runner: Callable[[int, Any, str], dict[str, Any]],
+    per_device_runner: Callable[[int, Any, str | None], dict[str, Any]],
     warmup: int,
     iteration: int,
     logger: Any,
@@ -81,6 +87,17 @@ def run_memory_benchmark_across_devices(
             float(metrics.get("duration_avg_ms", 0)),
             float(metrics.get("bandwidth_GBps", 0)),
         )
+        emit_log_metric(
+            testcase="tpubandwidth",
+            metric=f"{benchmark}_{mode}",
+            device=device_index,
+            value=metrics.get("bandwidth_GBps", 0),
+            unit="GB/s",
+            dimensions={
+                "coords": result.get("metadata", {}).get("coords"),
+                "core_on_chip": result.get("metadata", {}).get("core_on_chip"),
+            },
+        )
 
     aggregate_metrics = summarize_per_device_bandwidth(per_device_results)
     metadata = metadata_builder(num_devices)
@@ -99,7 +116,7 @@ def run_memory_benchmark_across_devices(
     }
 
 
-def run_traced_bandwidth_phases(
+def run_bandwidth_phases(
     *,
     compiled_fn: Callable,
     data_generator: Callable,
@@ -108,17 +125,18 @@ def run_traced_bandwidth_phases(
     metadata: dict[str, Any],
     warmup: int,
     iteration: int,
-    metrics_dir: str,
-    trace_dir: str,
+    metrics_dir: str | None,
+    trace_dir: str | None,
     dump_hlo: bool,
     dump_hlo_source_dir: str | None,
     dump_hlo_dir: str | None,
     clear_hlo_source: bool,
-    cleanup_trace: bool,
+    profile_artifacts: bool,
     logger: Any,
+    use_xprof_timing: bool = False,
     timing_config: TraceTimingConfig | None = None,
 ) -> dict[str, Any]:
-    """Run warmup, traced timing, JSONL output, and optional HLO collection."""
+    """Run warmup, synchronized timing, optional Xprof, and metric output."""
     logger.info("Phase 1: Warmup (%d iterations)", warmup)
     for _ in range(warmup):
         args = data_generator()
@@ -130,25 +148,36 @@ def run_traced_bandwidth_phases(
         finally:
             delete_device_object(result)
 
-    logger.info("Phase 2: Timed iterations (%d iterations)", iteration)
-    # Most memory kernels are represented by one XLA marker event with a
-    # device_duration_ps field. Some Pallas Mosaic kernels only expose a tiny
-    # custom-call bookkeeping duration there, so callers may override the trace
-    # extraction policy when the device marker is not a trustworthy denominator.
-    if timing_config is None:
-        timing_config = TraceTimingConfig(
-            task_name=f"timed_{test_name}",
-            trace_dir=trace_dir,
-            dest_name=f"trace_{test_name}",
-            cleanup_trace=cleanup_trace,
-            thread_name_contains="XLA Ops",
-        )
-    durations_ms = run_profiled_iterations(
-        compiled_fn=compiled_fn,
-        data_generator=data_generator,
-        iteration=iteration,
-        config=timing_config,
+    logger.info(
+        "Phase 2: %s timed iterations (%d iterations)",
+        "xprof" if use_xprof_timing else "CPU synchronized",
+        iteration,
     )
+    if use_xprof_timing or profile_artifacts:
+        # Most memory kernels are represented by one XLA marker event with a
+        # device_duration_ps field. Callers may override the trace extraction
+        # policy when that marker is not a trustworthy denominator.
+        if timing_config is None:
+            timing_config = TraceTimingConfig(
+                task_name=f"timed_{test_name}",
+                trace_dir=trace_dir,
+                dest_name=f"trace_{test_name}" if trace_dir else None,
+                cleanup_trace=False,
+                thread_name_contains="XLA Ops",
+            )
+        durations_ms = run_profiled_iterations(
+            compiled_fn=compiled_fn,
+            data_generator=data_generator,
+            iteration=iteration,
+            config=timing_config,
+            extract_trace_durations=use_xprof_timing,
+        )
+    else:
+        durations_ms = run_synchronized_iterations(
+            compiled_fn=compiled_fn,
+            data_generator=data_generator,
+            iteration=iteration,
+        )
 
     stats = MetricsStatistics(durations_ms, "duration", "ms")
     metrics = stats.serialize()
@@ -158,16 +187,19 @@ def run_traced_bandwidth_phases(
     bandwidth_gbps = compute_bandwidth_GBps(data_bytes, avg_duration_ms)
     metrics["data_size_bytes"] = data_bytes
     metrics["data_size_mib"] = data_bytes / (1024 * 1024)
-    if timing_config.require_marker and timing_config.duration_source == "device":
+    if not use_xprof_timing:
+        timing_source = "cpu_wall_clock_with_block_until_ready"
+    elif timing_config.require_marker and timing_config.duration_source == "device":
         timing_source = "xprof_marker_device_duration"
     elif timing_config.duration_source == "trace":
         timing_source = "xprof_trace_duration"
     else:
         timing_source = f"xprof_{timing_config.duration_source}_duration"
     metrics["timing_source"] = timing_source
-    metrics["trace_task_name"] = timing_config.task_name
-    metrics["trace_event_name_contains"] = timing_config.event_name_contains
-    metrics["trace_thread_name_contains"] = timing_config.thread_name_contains
+    if timing_config is not None and (use_xprof_timing or profile_artifacts):
+        metrics["trace_task_name"] = timing_config.task_name
+        metrics["trace_event_name_contains"] = timing_config.event_name_contains
+        metrics["trace_thread_name_contains"] = timing_config.thread_name_contains
     metrics["bandwidth_GBps"] = round(bandwidth_gbps, 4)
 
     write_jsonl_metrics(metrics_dir, test_name, metadata, metrics)

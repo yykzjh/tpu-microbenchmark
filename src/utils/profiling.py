@@ -12,16 +12,18 @@ from __future__ import annotations
 import os
 import glob
 import shutil
-import tempfile
 import logging
 import gzip
 import json
 import pathlib
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import jax
+
+from utils.runtime import benchmark_temporary_directory
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +107,12 @@ def get_trace(trace_dir: str) -> dict[str, Any]:
     """Load the latest xprof trace JSON from a JAX profiler trace directory."""
     profile_root = pathlib.Path(trace_dir).absolute() / "plugins" / "profile"
     if not profile_root.exists():
-        raise FileNotFoundError(f"xprof profile directory not found: {profile_root}")
+        raise FileNotFoundError("xprof profile directory not found")
 
     trace_files = list(profile_root.glob("**/*.trace.json.gz"))
     trace_files.extend(profile_root.glob("**/*.trace.json"))
     if not trace_files:
-        raise FileNotFoundError(f"No xprof trace JSON found under {profile_root}")
+        raise FileNotFoundError("No xprof trace JSON found")
 
     trace_file = max(trace_files, key=lambda path: path.stat().st_mtime)
     if trace_file.suffix == ".gz":
@@ -325,9 +327,11 @@ def run_profiled_iterations(
     data_generator,
     iteration: int,
     config: TraceTimingConfig,
+    extract_trace_durations: bool = True,
 ) -> list[float]:
-    """Run timed iterations under xprof and return configured marker durations."""
-    with tempfile.TemporaryDirectory() as tmp:
+    """Run iterations under Xprof and return trace or synchronized CPU durations."""
+    with benchmark_temporary_directory("xprof_") as tmp:
+        cpu_durations_ms = []
         with _trace_context(tmp, trace_only_xla=config.trace_only_xla):
             for i in range(iteration):
                 data_args = data_generator()
@@ -340,26 +344,32 @@ def run_profiled_iterations(
                         config.task_name,
                         step_num=i,
                     ):
+                        started_at = time.perf_counter()
                         result = compiled_fn(*data_args)
                         jax.block_until_ready(result)
+                        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                    cpu_durations_ms.append(elapsed_ms)
                 finally:
                     delete_device_object(result)
                     result = None
 
-        trace = get_trace(tmp)
-        durations_ms = marker_durations_ms_from_trace(
-            trace,
-            marker=config.marker,
-            expected_iterations=iteration,
-            duration_source=config.duration_source,
-            per_iteration_reducer=config.per_iteration_reducer,
-            event_name_contains=config.event_name_contains,
-            source_contains=config.source_contains,
-            kernel_name_contains=config.kernel_name_contains,
-            thread_name_contains=config.thread_name_contains,
-            require_marker=config.require_marker,
-            exclude_zero_crop=config.exclude_zero_crop,
-        )
+        if extract_trace_durations:
+            trace = get_trace(tmp)
+            durations_ms = marker_durations_ms_from_trace(
+                trace,
+                marker=config.marker,
+                expected_iterations=iteration,
+                duration_source=config.duration_source,
+                per_iteration_reducer=config.per_iteration_reducer,
+                event_name_contains=config.event_name_contains,
+                source_contains=config.source_contains,
+                kernel_name_contains=config.kernel_name_contains,
+                thread_name_contains=config.thread_name_contains,
+                require_marker=config.require_marker,
+                exclude_zero_crop=config.exclude_zero_crop,
+            )
+        else:
+            durations_ms = cpu_durations_ms
 
         if not config.cleanup_trace and config.trace_dir and config.dest_name:
             dest = os.path.join(config.trace_dir, config.dest_name)
@@ -367,6 +377,34 @@ def run_profiled_iterations(
                 shutil.rmtree(dest)
             shutil.copytree(tmp, dest)
 
+    return durations_ms
+
+
+def run_synchronized_iterations(
+    compiled_fn,
+    data_generator,
+    iteration: int,
+) -> list[float]:
+    """Measure host elapsed time around fully synchronized device execution.
+
+    Inputs are made ready before the timer starts. The result is explicitly
+    blocked before the stop timestamp so asynchronous JAX dispatch cannot turn
+    this into a kernel-issue latency measurement. This path does not start
+    Xprof and does not create trace or temporary files.
+    """
+    durations_ms = []
+    for _ in range(iteration):
+        data_args = data_generator()
+        jax.block_until_ready(data_args)
+        result = None
+        try:
+            started_at = time.perf_counter()
+            result = compiled_fn(*data_args)
+            jax.block_until_ready(result)
+            durations_ms.append((time.perf_counter() - started_at) * 1000.0)
+        finally:
+            delete_device_object(result)
+            result = None
     return durations_ms
 
 
@@ -403,6 +441,14 @@ def copy_hlo_dumps(
 ) -> list[str]:
     """Copy HLO dump files from *src_dir* to *dest_dir* with a test prefix."""
     os.makedirs(dest_dir, exist_ok=True)
+    if os.path.realpath(src_dir) == os.path.realpath(dest_dir):
+        retained = []
+        for pattern in ("*.before_optimizations.txt", "*.after_optimizations.txt"):
+            retained.extend(glob.glob(os.path.join(src_dir, pattern)))
+        if not retained:
+            logger.warning("No HLO dump files were generated")
+        return sorted(retained)
+
     copied = []
 
     for pattern in ("*.before_optimizations.txt", "*.after_optimizations.txt"):
@@ -415,10 +461,10 @@ def copy_hlo_dumps(
                 try:
                     os.remove(src_file)
                 except OSError as exc:
-                    logger.debug("Failed to remove copied HLO dump %s: %s", src_file, exc)
+                    logger.debug("Failed to remove a copied HLO dump: %s", exc)
 
     if not copied:
-        logger.warning("No HLO dump files found under %s", src_dir)
+        logger.warning("No HLO dump files were generated")
     return copied
 
 

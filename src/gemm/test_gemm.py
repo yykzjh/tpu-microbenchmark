@@ -4,8 +4,10 @@ Each JAX device runs one local matrix multiplication:
 
     C[m, n] = A[m, k] @ B[k, n]
 
-The input dtype is controlled by ``--dtype``. The timed xprof marker wraps only
-the matrix multiplication.
+The input dtype is controlled by ``--dtype``. Timing defaults to host elapsed
+time with an explicit device synchronization after every matrix multiplication.
+Pass ``--xprof-timing`` to use temporary trace-derived kernel durations instead.
+Pass ``--profile`` to retain both an Xprof trace and HLO dumps for analysis.
 """
 
 from __future__ import annotations
@@ -30,9 +32,10 @@ from utils.runtime import (
     configure_logging,
     configure_dump_hlo_from_argv,
     configure_tpu_benchmark_env,
+    default_profile_result_dir,
     device_metadata,
     get_local_devices_or_raise,
-    initialize_jax_runtime,
+    initialize_local_jax_runtime,
     log_device_separator,
     prepare_benchmark_dirs,
     validate_non_negative,
@@ -42,13 +45,18 @@ from utils.runtime import (
 # ---------------------------------------------------------------------------
 # Environment flags MUST be set before JAX is imported.
 # - LIBTPU_INIT_ARGS: TPU GEMM flags adapted from accelerator-microbenchmarks.
-# - XLA_FLAGS: --xla_dump_to for HLO graph dumps (only if --dump-hlo).
+# - XLA_FLAGS: --xla_dump_to for HLO graph dumps (only if --profile).
 # ---------------------------------------------------------------------------
 configure_tpu_benchmark_env("gemm")
 
 _DUMP_HLO = configure_dump_hlo_from_argv("gemm")
 
-from utils.metrics import MetricsStatistics, average_min_max, write_jsonl_metrics
+from utils.metrics import (
+    MetricsStatistics,
+    average_min_max,
+    emit_log_metric,
+    write_jsonl_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +65,7 @@ def load_jax_runtime_deps() -> None:
     """Import JAX-dependent modules after CLI parsing."""
     global jax, jnp, MARKER, collect_hlo_dumps_if_requested
     global TraceTimingConfig, delete_device_object, run_profiled_iterations
+    global run_synchronized_iterations
 
     import jax as _jax
     import jax.numpy as _jnp
@@ -66,6 +75,7 @@ def load_jax_runtime_deps() -> None:
         collect_hlo_dumps_if_requested as _collect_hlo_dumps_if_requested,
         delete_device_object as _delete_device_object,
         run_profiled_iterations as _run_profiled_iterations,
+        run_synchronized_iterations as _run_synchronized_iterations,
     )
 
     jax = _jax
@@ -75,6 +85,7 @@ def load_jax_runtime_deps() -> None:
     collect_hlo_dumps_if_requested = _collect_hlo_dumps_if_requested
     delete_device_object = _delete_device_object
     run_profiled_iterations = _run_profiled_iterations
+    run_synchronized_iterations = _run_synchronized_iterations
 
 
 @dataclass(frozen=True)
@@ -113,6 +124,13 @@ def parse_input_dtype(dtype_name: str):
 def dtype_name(dtype) -> str:
     """Return a stable dtype display name."""
     return jnp.dtype(dtype).name
+
+
+def canonical_dtype_name(dtype_name_input: str) -> str:
+    """Return the catalog/log spelling used by CommPilot."""
+    normalized = dtype_name_input.strip().lower()
+    aliases = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
+    return aliases.get(normalized, normalized)
 
 
 def validate_shape(shape: GemmShape) -> None:
@@ -182,12 +200,12 @@ def run_gemm_per_device(
     input_dtype_display: str,
     warmup: int,
     iteration: int,
-    output_directory: str,
-    metrics_dir: str,
-    trace_dir: str,
+    output_directory: str | None,
+    metrics_dir: str | None,
+    trace_dir: str | None,
     dump_hlo_dir: str | None,
-    dump_hlo: bool = False,
-    cleanup_trace: bool = False,
+    profile_artifacts: bool = False,
+    use_xprof_timing: bool = False,
 ) -> dict[str, Any]:
     """Run GEMM benchmark on one local JAX device."""
     lhs = rhs = None
@@ -207,7 +225,7 @@ def run_gemm_per_device(
 
         def data_generator():
             # Reuse the same resident operands for every timed iteration. That
-            # keeps the xprof marker around the GEMM only.
+            # keeps input setup outside the measured GEMM region.
             return lhs, rhs
 
         logger.info("Phase 1: warmup (%d iterations)", warmup)
@@ -220,35 +238,44 @@ def run_gemm_per_device(
                 delete_device_object(result)
 
         logger.info(
-            "Phase 2: xprof marker timed iterations (%d iterations)",
+            "Phase 2: %s timed iterations (%d iterations)",
+            "Xprof" if use_xprof_timing else "CPU synchronized",
             iteration,
         )
         test_name = (
             f"tpu_gemm_device{device_index}_m{shape.m}_n{shape.n}_"
             f"k{shape.k}_{input_dtype_display}"
         )
-        durations_ms = run_profiled_iterations(
-            compiled_fn=compiled_fn,
-            data_generator=data_generator,
-            iteration=iteration,
-            config=TraceTimingConfig(
-                task_name=test_name,
-                trace_dir=trace_dir,
-                dest_name=f"{test_name}_timed",
-                cleanup_trace=cleanup_trace,
-                kernel_name_contains=["convolution", "dot_general", "dot"],
-                thread_name_contains="XLA Ops",
-                per_iteration_reducer="max",
-                require_marker=False,
-            ),
-        )
+        if use_xprof_timing or profile_artifacts:
+            durations_ms = run_profiled_iterations(
+                compiled_fn=compiled_fn,
+                data_generator=data_generator,
+                iteration=iteration,
+                config=TraceTimingConfig(
+                    task_name=test_name,
+                    trace_dir=trace_dir,
+                    dest_name=f"{test_name}_timed" if trace_dir else None,
+                    cleanup_trace=False,
+                    kernel_name_contains=["convolution", "dot_general", "dot"],
+                    thread_name_contains="XLA Ops",
+                    per_iteration_reducer="max",
+                    require_marker=False,
+                ),
+                extract_trace_durations=use_xprof_timing,
+            )
+        else:
+            durations_ms = run_synchronized_iterations(
+                compiled_fn=compiled_fn,
+                data_generator=data_generator,
+                iteration=iteration,
+            )
 
         collect_hlo_dumps_if_requested(
-            dump_hlo,
-            _DUMP_HLO.temp_dir,
+            profile_artifacts,
+            _DUMP_HLO.dump_dir,
             dump_hlo_dir,
             test_name,
-            clear_source=_DUMP_HLO.owned,
+            clear_source=False,
         )
 
         duration_stats = MetricsStatistics(durations_ms, "duration", unit="ms")
@@ -257,7 +284,10 @@ def run_gemm_per_device(
         flops_per_device = 2 * shape.m * shape.n * shape.k
         metrics.update({
             "flops": flops_per_device,
-            "timing_source": "xprof_gemm_device_kernel_duration",
+            "timing_source": (
+                "xprof_gemm_device_kernel_duration"
+                if use_xprof_timing else "cpu_wall_clock_with_block_until_ready"
+            ),
             "output_dtype": "jax_matmul_inferred",
             "tflops": round(compute_tflops(flops_per_device, avg_ms), 4),
         })
@@ -277,7 +307,8 @@ def run_gemm_per_device(
             "flops_formula": "2 * m * n * k",
             "warmup": warmup,
             "iteration": iteration,
-            "dump_hlo": dump_hlo,
+            "profile_artifacts": profile_artifacts,
+            "timing_mode": "xprof" if use_xprof_timing else "cpu",
         }
         write_jsonl_metrics(metrics_dir, test_name, metadata, metrics)
 
@@ -297,17 +328,20 @@ def run_gemm(
     dtype_name_input: str,
     warmup: int,
     iteration: int,
-    result_dir: str,
-    dump_hlo: bool = False,
-    cleanup_trace: bool = False,
+    result_dir: str | None,
+    profile_artifacts: bool = False,
+    use_xprof_timing: bool = False,
 ) -> dict[str, Any]:
     """Run GEMM sequentially on every local JAX device."""
     validate_shape(shape)
     validate_non_negative("warmup", warmup)
     validate_positive("iteration", iteration)
 
+    if profile_artifacts and result_dir is None:
+        result_dir = default_profile_result_dir("gemm")
+
     input_dtype = parse_input_dtype(dtype_name_input)
-    input_dtype_display = dtype_name(input_dtype)
+    input_dtype_display = canonical_dtype_name(dtype_name_input)
     devices = get_local_devices_or_raise()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -315,7 +349,12 @@ def run_gemm(
         f"{ts}_gemm_m{shape.m}_n{shape.n}_k{shape.k}_"
         f"dtype{input_dtype_display}_{len(devices)}devices"
     )
-    dirs = prepare_benchmark_dirs(result_dir, run_name, dump_hlo=dump_hlo)
+    dirs = prepare_benchmark_dirs(
+        result_dir,
+        run_name,
+        dump_hlo=profile_artifacts,
+        create_trace=profile_artifacts,
+    )
     out_dir = dirs.output_dir
     metrics_dir = dirs.metrics_dir
     trace_dir = dirs.trace_dir
@@ -338,8 +377,8 @@ def run_gemm(
             metrics_dir=metrics_dir,
             trace_dir=trace_dir,
             dump_hlo_dir=dump_hlo_dir,
-            dump_hlo=dump_hlo,
-            cleanup_trace=cleanup_trace,
+            profile_artifacts=profile_artifacts,
+            use_xprof_timing=use_xprof_timing,
         )
         per_device_results.append(device_result)
         logger.info(
@@ -375,7 +414,9 @@ def run_gemm(
         "execution": "sequential_per_local_device",
         "warmup": warmup,
         "iteration": iteration,
-        "dump_hlo": dump_hlo,
+        "profile_artifacts": profile_artifacts,
+        "dump_hlo_dir": dump_hlo_dir,
+        "timing_mode": "xprof" if use_xprof_timing else "cpu",
     }
 
     return {
@@ -391,8 +432,7 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
     metadata = results.get("metadata", {})
     per_device_results = results.get("per_device_results", [])
     aggregate_metrics = results.get("aggregate_metrics", {})
-    output_directory = results.get("output_directory")
-    return {
+    summary = {
         "benchmark": "gemm",
         "shape": {
             "m": metadata.get("m"),
@@ -422,23 +462,8 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
             for result in per_device_results
         ],
         "aggregate": aggregate_metrics,
-        "output": {
-            "run_dir": output_directory,
-            "metrics_dir": (
-                os.path.join(output_directory, "metrics")
-                if output_directory else None
-            ),
-            "trace_dir": (
-                os.path.join(output_directory, "trace")
-                if output_directory else None
-            ),
-            "dump_hlo_enabled": metadata.get("dump_hlo"),
-            "dump_hlo_dir": (
-                os.path.join(output_directory, "dump_hlo")
-                if output_directory and metadata.get("dump_hlo") else None
-            ),
-        },
     }
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -471,18 +496,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--result-dir",
-        default="./results",
-        help="Root directory for results (default: ./results)",
+        default=None,
+        help="Optional output directory for JSONL metrics and retained profile artifacts",
     )
     parser.add_argument(
+        "--xprof-timing",
+        action="store_true",
+        help=(
+            "Use a temporary Xprof trace for timing; the trace is always "
+            "deleted after parsing"
+        ),
+    )
+    parser.add_argument(
+        "--profile",
         "--dump-hlo",
+        dest="profile",
         action="store_true",
-        help="Collect XLA HLO dumps",
-    )
-    parser.add_argument(
-        "--cleanup-trace",
-        action="store_true",
-        help="Delete xprof trace directory after extracting durations to save disk space",
+        help="Retain Xprof trace and XLA HLO dumps for performance analysis",
     )
     return parser.parse_args()
 
@@ -492,21 +522,31 @@ def main() -> None:
     args = parse_args()
     configure_logging()
     load_jax_runtime_deps()
-    initialize_jax_runtime(logger)
+    initialize_local_jax_runtime(logger)
 
-    try:
-        results = run_gemm(
-            shape=GemmShape(m=args.m, n=args.n, k=args.k),
-            dtype_name_input=args.dtype,
-            warmup=args.warmup,
-            iteration=args.iteration,
-            result_dir=args.result_dir,
-            dump_hlo=args.dump_hlo,
-            cleanup_trace=args.cleanup_trace,
+    results = run_gemm(
+        shape=GemmShape(m=args.m, n=args.n, k=args.k),
+        dtype_name_input=args.dtype,
+        warmup=args.warmup,
+        iteration=args.iteration,
+        result_dir=args.result_dir,
+        profile_artifacts=args.profile,
+        use_xprof_timing=args.xprof_timing,
+    )
+    dtype = str(results["metadata"]["input_dtype"])
+    for result in results["per_device_results"]:
+        emit_log_metric(
+            testcase="gemm",
+            metric=dtype,
+            device=result["metadata"].get("device_index"),
+            value=result["metrics"]["tflops"],
+            unit="TFLOPS/chiplet",
+            dimensions={
+                "coords": result["metadata"].get("coords"),
+                "core_on_chip": result["metadata"].get("core_on_chip"),
+            },
         )
-        print(json.dumps(format_cli_summary(results), indent=2, default=str))
-    finally:
-        _DUMP_HLO.cleanup()
+    print(json.dumps(format_cli_summary(results), indent=2, default=str))
 
 
 if __name__ == "__main__":

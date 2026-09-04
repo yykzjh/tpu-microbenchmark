@@ -124,18 +124,20 @@ def add_memory_common_args(
     parser.add_argument(
         "--result-dir",
         type=str,
-        default="./results",
-        help="Result directory (default: ./results)",
+        default=None,
+        help="Optional output directory for JSONL metrics and retained profile artifacts",
     )
     parser.add_argument(
+        "--xprof-timing",
+        action="store_true",
+        help="Use temporary Xprof trace durations instead of synchronized CPU timing",
+    )
+    parser.add_argument(
+        "--profile",
         "--dump-hlo",
+        dest="profile",
         action="store_true",
-        help="Enable HLO dump collection",
-    )
-    parser.add_argument(
-        "--cleanup-trace",
-        action="store_true",
-        help="Cleanup trace directory after extracting durations",
+        help="Persist Xprof traces and HLO dumps for performance analysis",
     )
 
 

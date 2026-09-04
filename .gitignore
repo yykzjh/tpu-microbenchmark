@@ -32,6 +32,13 @@ MANIFEST
 *.manifest
 *.spec
 
+# Local benchmark inputs and outputs (never publish node lists or credentials)
+/logs/
+/results/
+/hostfile
+/hostfile.*
+/.env
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

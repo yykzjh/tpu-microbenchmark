@@ -6,7 +6,7 @@ over the PCIe link between CPU and local TPU chiplet devices:
   - h2d: host-to-device transfer with ``jax.device_put``
   - d2h: device-to-host transfer with ``jax.device_get``
 
-Each mode runs two test items:
+Select transfer scope with --pcie-mode (default: one_to_one; both runs both):
 
   - one_to_one: CPU transfers with each selected local TPU device one by one.
   - one_to_many: CPU transfers with all selected local TPU devices concurrently.
@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,8 +36,9 @@ if SRC_DIR not in sys.path:
 from utils.runtime import (
     configure_logging,
     configure_tpu_benchmark_env,
+    default_profile_result_dir,
     get_local_devices_or_raise,
-    initialize_jax_runtime,
+    initialize_local_jax_runtime,
     log_device_separator,
     prepare_benchmark_dirs,
     validate_non_negative,
@@ -57,6 +57,7 @@ from utils.metrics import (
     MetricsStatistics,
     average_min_max,
     compute_bandwidth_GBps,
+    emit_log_metric,
     write_jsonl_metrics,
 )
 
@@ -69,15 +70,22 @@ TRANSFER_ROW_BYTES = TRANSFER_ROW_ELEMENTS * FLOAT32_BYTES
 
 def load_jax_runtime_deps() -> None:
     """Import JAX-dependent modules after CLI parsing."""
-    global jax, delete_device_object
+    global jax, delete_device_object, TraceTimingConfig
+    global run_profiled_iterations, run_synchronized_iterations
 
     import jax as _jax
     from utils.profiling import (
+        TraceTimingConfig as _TraceTimingConfig,
         delete_device_object as _delete_device_object,
+        run_profiled_iterations as _run_profiled_iterations,
+        run_synchronized_iterations as _run_synchronized_iterations,
     )
 
     jax = _jax
     delete_device_object = _delete_device_object
+    TraceTimingConfig = _TraceTimingConfig
+    run_profiled_iterations = _run_profiled_iterations
+    run_synchronized_iterations = _run_synchronized_iterations
 
 
 @dataclass(frozen=True)
@@ -284,6 +292,7 @@ def next_d2h_source(source_iter: Iterator[Any]) -> Any:
 def summarize_transfer_durations(
     durations: list[float],
     bytes_per_measurement: int,
+    use_xprof_timing: bool,
 ) -> dict[str, Any]:
     """Return duration and PCIe transfer statistics for one item."""
     duration_stats = MetricsStatistics(durations, "duration", unit="ms")
@@ -292,7 +301,10 @@ def summarize_transfer_durations(
     metrics.update({
         "bytes_per_measurement": bytes_per_measurement,
         "bandwidth_GBps": round(compute_bandwidth_GBps(bytes_per_measurement, avg_ms), 4),
-        "timing_source": "wall_clock_with_block_until_ready",
+        "timing_source": (
+            "xprof_trace_duration"
+            if use_xprof_timing else "cpu_wall_clock_with_block_until_ready"
+        ),
     })
     return metrics
 
@@ -317,41 +329,41 @@ def run_transfer_warmup(operation: Callable[[], Any], warmup: int) -> None:
 def run_transfer_iterations(
     operation: Callable[[], Any],
     iteration: int,
-    trace_dir: str,
+    trace_dir: str | None,
     trace_name: str,
-    cleanup_trace: bool = False,
+    use_xprof_timing: bool = False,
+    profile_artifacts: bool = False,
 ) -> list[float]:
-    """Run one transfer case and return wall-clock durations in milliseconds.
+    """Run one transfer case with synchronized CPU timing or optional Xprof.
 
     Host-device transfer APIs are runtime calls rather than compiled TPU
-    kernels. Following AI-Hypercomputer/accelerator-microbenchmarks, the primary
-    timing is Python wall-clock around the transfer plus
-    ``jax.block_until_ready``. Xprof trace is retained only for diagnosis.
+    kernels. The default path measures Python wall-clock around the transfer
+    and explicitly blocks the returned value. It creates no trace files.
     """
     task_name = f"timed_{trace_name}"
-    case_trace_dir = os.path.join(trace_dir, trace_name)
-    os.makedirs(case_trace_dir, exist_ok=True)
-    durations = []
-    with jax.profiler.trace(case_trace_dir, create_perfetto_link=False):
-        for i in range(iteration):
-            result = None
-            try:
-                start = time.perf_counter()
-                with jax.profiler.TraceAnnotation(task_name):
-                    with jax.profiler.StepTraceAnnotation(task_name, step_num=i):
-                        result = operation()
-                        block_transfer_result(result)
-                end = time.perf_counter()
-                durations.append((end - start) * 1000.0)
-            finally:
-                delete_device_object(result)
-                result = None
+    if not use_xprof_timing and not profile_artifacts:
+        return run_synchronized_iterations(
+            compiled_fn=lambda: operation(),
+            data_generator=lambda: (),
+            iteration=iteration,
+        )
 
-    if cleanup_trace:
-        import shutil
-
-        shutil.rmtree(case_trace_dir, ignore_errors=True)
-    return durations
+    return run_profiled_iterations(
+        compiled_fn=lambda: operation(),
+        data_generator=lambda: (),
+        iteration=iteration,
+        config=TraceTimingConfig(
+            task_name=task_name,
+            trace_dir=trace_dir,
+            dest_name=trace_name if trace_dir else None,
+            cleanup_trace=False,
+            duration_source="trace",
+            require_marker=False,
+            event_name_contains=task_name,
+            per_iteration_reducer="max",
+        ),
+        extract_trace_durations=use_xprof_timing,
+    )
 
 
 def run_h2d_one_to_one(
@@ -360,8 +372,9 @@ def run_h2d_one_to_one(
     warmup: int,
     iteration: int,
     data_size_bytes: int,
-    trace_dir: str,
-    cleanup_trace: bool,
+    trace_dir: str | None,
+    use_xprof_timing: bool,
+    profile_artifacts: bool,
 ) -> list[dict[str, Any]]:
     """Run sequential CPU-to-one-TPU H2D tests."""
     results = []
@@ -385,14 +398,17 @@ def run_h2d_one_to_one(
                 iteration,
                 trace_dir,
                 trace_name=f"trace_h2d_one_to_one_target{target.target_index}",
-                cleanup_trace=cleanup_trace,
+                use_xprof_timing=use_xprof_timing,
+                profile_artifacts=profile_artifacts,
             )
         finally:
             del host_batch
         results.append({
             "test_item": "one_to_one",
             "target": format_target(target),
-            "metrics": summarize_transfer_durations(durations, data_size_bytes),
+            "metrics": summarize_transfer_durations(
+                durations, data_size_bytes, use_xprof_timing
+            ),
         })
     return results
 
@@ -403,8 +419,9 @@ def run_d2h_one_to_one(
     warmup: int,
     iteration: int,
     data_size_bytes: int,
-    trace_dir: str,
-    cleanup_trace: bool,
+    trace_dir: str | None,
+    use_xprof_timing: bool,
+    profile_artifacts: bool,
 ) -> list[dict[str, Any]]:
     """Run sequential one-TPU-to-CPU D2H tests."""
     results = []
@@ -427,14 +444,17 @@ def run_d2h_one_to_one(
                 iteration,
                 trace_dir,
                 trace_name=f"trace_d2h_one_to_one_target{target.target_index}",
-                cleanup_trace=cleanup_trace,
+                use_xprof_timing=use_xprof_timing,
+                profile_artifacts=profile_artifacts,
             )
         finally:
             delete_device_object(source_batch)
         results.append({
             "test_item": "one_to_one",
             "target": format_target(target),
-            "metrics": summarize_transfer_durations(durations, data_size_bytes),
+            "metrics": summarize_transfer_durations(
+                durations, data_size_bytes, use_xprof_timing
+            ),
         })
     return results
 
@@ -445,8 +465,9 @@ def run_h2d_one_to_many(
     warmup: int,
     iteration: int,
     data_size_bytes: int,
-    trace_dir: str,
-    cleanup_trace: bool,
+    trace_dir: str | None,
+    use_xprof_timing: bool,
+    profile_artifacts: bool,
 ) -> dict[str, Any]:
     """Run concurrent CPU-to-many-TPU H2D tests."""
     host_batch = prepare_h2d_host_batch(host_buffer, warmup + iteration)
@@ -472,13 +493,16 @@ def run_h2d_one_to_many(
                 iteration,
                 trace_dir,
                 trace_name="trace_h2d_one_to_many",
-                cleanup_trace=cleanup_trace,
+                use_xprof_timing=use_xprof_timing,
+                profile_artifacts=profile_artifacts,
             )
     finally:
         del host_batch
 
     total_bytes = data_size_bytes * len(targets)
-    metrics = summarize_transfer_durations(durations, total_bytes)
+    metrics = summarize_transfer_durations(
+        durations, total_bytes, use_xprof_timing
+    )
     metrics["per_target_bytes"] = data_size_bytes
     metrics["target_count"] = len(targets)
     return {
@@ -494,8 +518,9 @@ def run_d2h_one_to_many(
     warmup: int,
     iteration: int,
     data_size_bytes: int,
-    trace_dir: str,
-    cleanup_trace: bool,
+    trace_dir: str | None,
+    use_xprof_timing: bool,
+    profile_artifacts: bool,
 ) -> dict[str, Any]:
     """Run concurrent many-TPU-to-CPU D2H tests."""
     source_batches = {
@@ -533,13 +558,16 @@ def run_d2h_one_to_many(
                 iteration,
                 trace_dir,
                 trace_name="trace_d2h_one_to_many",
-                cleanup_trace=cleanup_trace,
+                use_xprof_timing=use_xprof_timing,
+                profile_artifacts=profile_artifacts,
             )
     finally:
         delete_device_object(list(source_batches.values()))
 
     total_bytes = data_size_bytes * len(targets)
-    metrics = summarize_transfer_durations(durations, total_bytes)
+    metrics = summarize_transfer_durations(
+        durations, total_bytes, use_xprof_timing
+    )
     metrics["per_target_bytes"] = data_size_bytes
     metrics["target_count"] = len(targets)
     return {
@@ -550,7 +578,7 @@ def run_d2h_one_to_many(
 
 
 def write_case_metrics(
-    metrics_dir: str,
+    metrics_dir: str | None,
     benchmark: str,
     metadata: dict[str, Any],
     case: dict[str, Any],
@@ -607,15 +635,21 @@ def run_pcie(
     data_size: str | int,
     warmup: int,
     iteration: int,
-    result_dir: str,
+    result_dir: str | None,
     target_devices: int,
-    cleanup_trace: bool = False,
+    profile_artifacts: bool = False,
+    use_xprof_timing: bool = False,
+    pcie_mode: str = "one_to_one",
 ) -> dict[str, Any]:
     """Run H2D or D2H PCIe benchmark."""
     if benchmark not in {"h2d", "d2h"}:
         raise ValueError(f"Unknown benchmark: {benchmark}")
+    if pcie_mode not in {"one_to_one", "one_to_many", "both"}:
+        raise ValueError(f"Unknown PCIe mode: {pcie_mode}")
     validate_non_negative("warmup", warmup)
     validate_positive("iteration", iteration)
+    if profile_artifacts and result_dir is None:
+        result_dir = default_profile_result_dir("tpubandwidth")
 
     parsed_data_size = parse_data_size(
         data_size,
@@ -638,13 +672,11 @@ def run_pcie(
         result_dir,
         run_name,
         dump_hlo=False,
-        create_trace=True,
+        create_trace=profile_artifacts,
     )
     out_dir = dirs.output_dir
     metrics_dir = dirs.metrics_dir
     trace_dir = dirs.trace_dir
-    if metrics_dir is None or trace_dir is None:
-        raise RuntimeError("metrics and trace directories are required")
 
     metadata = {
         "benchmark": benchmark,
@@ -657,9 +689,11 @@ def run_pcie(
         "target_device_count": len(targets),
         "target_selection": "all_chiplet_devices_per_chip",
         "test_domain": "pcie",
+        "pcie_mode": pcie_mode,
         "warmup": warmup,
         "iteration": iteration,
-        "cleanup_trace": cleanup_trace,
+        "profile_artifacts": profile_artifacts,
+        "timing_mode": "xprof" if use_xprof_timing else "cpu",
     }
 
     logger.info(
@@ -669,54 +703,29 @@ def run_pcie(
         [format_target(target) for target in targets],
     )
     try:
-        if benchmark == "h2d":
-            one_to_one_cases = run_h2d_one_to_one(
-                host_buffer,
-                targets,
-                warmup,
-                iteration,
-                data_size_bytes,
-                trace_dir,
-                cleanup_trace,
-            )
-            one_to_many_case = run_h2d_one_to_many(
-                host_buffer,
-                targets,
-                warmup,
-                iteration,
-                data_size_bytes,
-                trace_dir,
-                cleanup_trace,
-            )
-        else:
-            one_to_one_cases = run_d2h_one_to_one(
-                host_buffer,
-                targets,
-                warmup,
-                iteration,
-                data_size_bytes,
-                trace_dir,
-                cleanup_trace,
-            )
-            one_to_many_case = run_d2h_one_to_many(
-                host_buffer,
-                targets,
-                warmup,
-                iteration,
-                data_size_bytes,
-                trace_dir,
-                cleanup_trace,
-            )
+        args = (host_buffer, targets, warmup, iteration, data_size_bytes,
+                trace_dir, use_xprof_timing, profile_artifacts)
+        one_to_one_cases = []
+        one_to_many_case = None
+        if pcie_mode in {"one_to_one", "both"}:
+            runner = run_h2d_one_to_one if benchmark == "h2d" else run_d2h_one_to_one
+            one_to_one_cases = runner(*args)
+        if pcie_mode in {"one_to_many", "both"}:
+            runner = run_h2d_one_to_many if benchmark == "h2d" else run_d2h_one_to_many
+            one_to_many_case = runner(*args)
 
-        case_results = [*one_to_one_cases, one_to_many_case]
+        case_results = list(one_to_one_cases)
+        if one_to_many_case is not None:
+            case_results.append(one_to_many_case)
         for case in case_results:
             write_case_metrics(metrics_dir, benchmark, metadata, case)
 
         return {
             "metadata": metadata,
+            "targets": [format_target(target) for target in targets],
             "one_to_one": one_to_one_cases,
             "one_to_many": one_to_many_case,
-            "one_to_one_summary": aggregate_one_to_one(one_to_one_cases),
+            "one_to_one_summary": aggregate_one_to_one(one_to_one_cases) if one_to_one_cases else None,
             "output_directory": out_dir,
         }
     finally:
@@ -728,8 +737,9 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
     """Return a compact JSON-safe terminal summary."""
     metadata = results["metadata"]
     one_to_many = results["one_to_many"]
-    return {
+    summary = {
         "benchmark": metadata["benchmark"],
+        "pcie_mode": metadata["pcie_mode"],
         "transfer_direction": metadata["transfer_direction"],
         "data_size": {
             "input": metadata["data_size_input"],
@@ -739,28 +749,24 @@ def format_cli_summary(results: dict[str, Any]) -> dict[str, Any]:
         "targets": {
             "count": metadata["target_device_count"],
             "selection": metadata["target_selection"],
-            "devices": [
-                case["target"] for case in results["one_to_one"]
-            ],
+            "devices": results["targets"],
         },
         "iterations": {
             "warmup": metadata["warmup"],
             "timed": metadata["iteration"],
         },
-        "one_to_one_summary": results["one_to_one_summary"],
-        "one_to_many": {
+    }
+    if results["one_to_one"]:
+        summary["one_to_one_summary"] = results["one_to_one_summary"]
+    if one_to_many is not None:
+        summary["one_to_many"] = {
             "bandwidth_GBps": one_to_many["metrics"].get("bandwidth_GBps"),
             "bytes_per_measurement": one_to_many["metrics"].get(
                 "bytes_per_measurement"
             ),
             "target_count": one_to_many["metrics"].get("target_count"),
-        },
-        "output": {
-            "run_dir": results["output_directory"],
-            "metrics_dir": os.path.join(results["output_directory"], "metrics"),
-            "trace_dir": os.path.join(results["output_directory"], "trace"),
-        },
-    }
+        }
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -769,6 +775,12 @@ def parse_args() -> argparse.Namespace:
         description="TPU PCIe transfer benchmark"
     )
     common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument(
+        "--pcie-mode",
+        choices=("one_to_one", "one_to_many", "both"),
+        default="one_to_one",
+        help="Transfer scope (default: one_to_one); both runs sequential then concurrent transfers",
+    )
     common_parser.add_argument(
         "--data-size",
         required=True,
@@ -791,8 +803,8 @@ def parse_args() -> argparse.Namespace:
     )
     common_parser.add_argument(
         "--result-dir",
-        default="./results",
-        help="Root directory for results (default: ./results)",
+        default=None,
+        help="Optional output directory for JSONL metrics and retained profile artifacts",
     )
     common_parser.add_argument(
         "--target-devices",
@@ -801,9 +813,17 @@ def parse_args() -> argparse.Namespace:
         help="Number of TPU chiplet devices to test (default: 8, i.e. 4 chips × 2 chiplets)",
     )
     common_parser.add_argument(
-        "--cleanup-trace",
+        "--xprof-timing",
         action="store_true",
-        help="Delete diagnostic xprof traces after timed iterations",
+        help=(
+            "Use a temporary Xprof trace for timing; the trace is always "
+            "deleted after parsing"
+        ),
+    )
+    common_parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Retain Xprof trace for performance analysis",
     )
     subparsers = parser.add_subparsers(dest="benchmark", required=True)
     subparsers.add_parser(
@@ -819,12 +839,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def emit_pcie_log_metrics(results: dict[str, Any], benchmark: str) -> None:
+    """Keep per-device and host aggregate bandwidth as separate metrics."""
+    for case in results["one_to_one"]:
+        emit_log_metric(
+            testcase="tpubandwidth",
+            metric=benchmark,
+            device=case["target"].get("target_index"),
+            value=case["metrics"]["bandwidth_GBps"],
+            unit="GB/s",
+            dimensions={"scope": "one_to_one"},
+        )
+    if results["one_to_many"] is None:
+        return
+    aggregate = results["one_to_many"]["metrics"]
+    emit_log_metric(
+        testcase="tpubandwidth",
+        metric=f"{benchmark}_one_to_many",
+        value=aggregate["bandwidth_GBps"],
+        unit="GB/s",
+        dimensions={
+            "scope": "one_to_many",
+            "accounting_unit": "host_aggregate",
+            "target_count": aggregate["target_count"],
+            "target_indices": [target["target_index"] for target in results["one_to_many"]["targets"]],
+            "bytes_per_measurement": aggregate["bytes_per_measurement"],
+            "per_target_bytes": aggregate["per_target_bytes"],
+        },
+    )
+
+
 def main() -> None:
     """CLI entry point."""
     args = parse_args()
     configure_logging()
     load_jax_runtime_deps()
-    initialize_jax_runtime(logger)
+    initialize_local_jax_runtime(logger)
 
     results = run_pcie(
         benchmark=args.benchmark,
@@ -833,8 +883,11 @@ def main() -> None:
         iteration=args.iteration,
         result_dir=args.result_dir,
         target_devices=args.target_devices,
-        cleanup_trace=args.cleanup_trace,
+        pcie_mode=args.pcie_mode,
+        profile_artifacts=args.profile,
+        use_xprof_timing=args.xprof_timing,
     )
+    emit_pcie_log_metrics(results, args.benchmark)
     print(json.dumps(format_cli_summary(results), indent=2, default=str))
 
 

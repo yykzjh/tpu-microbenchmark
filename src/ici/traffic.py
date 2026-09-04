@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,33 @@ from ici.constants import (
 
 logger = logging.getLogger(__name__)
 
+
+def neighboring_p2p_chiplet_pairs(
+    chip_order: list[tuple[int, int, int]],
+    slice_topology: tuple[int, int, int],
+) -> list[tuple[int, int]]:
+    """Directed die links plus core-0 links to physical Slice neighbors.
+
+    Coordinates belong to the full Slice, even when chip_order is a subset.
+    Slices up to 4x4x4 are meshes without wraparound links. Larger Slice
+    adjacency must be confirmed before using this restricted test mode.
+    """
+    if any(dim > 4 for dim in slice_topology):
+        raise ValueError(
+            "--p2p-pair-mode neighbors requires a Slice no larger than "
+            "4x4x4; larger-Slice physical adjacency is not configured"
+        )
+    pairs = []
+    for src, src_coord in enumerate(chip_order):
+        pairs.extend([(2 * src, 2 * src + 1), (2 * src + 1, 2 * src)])
+        for dst, dst_coord in enumerate(chip_order):
+            if src != dst and sum(
+                abs(a - b) for a, b in zip(src_coord, dst_coord)
+            ) == 1:
+                pairs.append((2 * src, 2 * dst))
+    return pairs
+
+
 @dataclass
 class TrafficCase:
     """One concrete traffic matrix execution case."""
@@ -26,6 +54,81 @@ class TrafficCase:
     matrix: np.ndarray
     active_pairs: list[tuple[int, int]]
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TpuBlockRange:
+    """One half-open cuboid over TPU chip coordinates."""
+
+    axes: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+
+    @property
+    def origin(self) -> tuple[int, int, int]:
+        return tuple(start for start, _ in self.axes)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return tuple(end - start for start, end in self.axes)
+
+    @property
+    def chip_count(self) -> int:
+        x, y, z = self.shape
+        return x * y * z
+
+    @property
+    def spec(self) -> str:
+        return ",".join(f"{start}:{end}" for start, end in self.axes)
+
+    @property
+    def label(self) -> str:
+        return "_".join(
+            f"{axis}{start}-{end}"
+            for axis, (start, end) in zip("xyz", self.axes)
+        )
+
+    def contains(self, coord: tuple[int, int, int]) -> bool:
+        return all(
+            start <= value < end
+            for value, (start, end) in zip(coord, self.axes)
+        )
+
+    def normalize(self, coord: tuple[int, int, int]) -> tuple[int, int, int]:
+        return tuple(
+            value - start
+            for value, (start, _) in zip(coord, self.axes)
+        )
+
+
+_TPU_BLOCK_RANGE = re.compile(
+    r"^(\d+):(\d+),(\d+):(\d+),(\d+):(\d+)$"
+)
+
+
+def parse_tpu_block_range(
+    value: str | None,
+    topology: tuple[int, int, int],
+) -> TpuBlockRange:
+    """Parse and validate an x,y,z half-open TPU chip block range."""
+    if value is None:
+        return TpuBlockRange(tuple((0, dim) for dim in topology))
+    match = _TPU_BLOCK_RANGE.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(
+            "--block-range must use x,y,z half-open slices such as "
+            "0:2,0:2,2:4"
+        )
+    numbers = tuple(int(item) for item in match.groups())
+    axes = tuple(
+        (numbers[index], numbers[index + 1])
+        for index in range(0, len(numbers), 2)
+    )
+    for axis_name, (start, end), dimension in zip("xyz", axes, topology):
+        if start < 0 or start >= end or end > dimension:
+            raise ValueError(
+                f"--block-range axis {axis_name}={start}:{end} is outside "
+                f"slice dimension 0:{dimension}"
+            )
+    return TpuBlockRange(axes)
 
 
 def format_active_pairs_compact(active_pairs: list[tuple[int, int]]) -> str:
@@ -78,12 +181,12 @@ def format_traffic_case(case: TrafficCase) -> dict[str, Any]:
     }
 
 
-def local_chiplet_ids() -> set[int]:
-    """Return global JAX-device indices that are addressable by this process."""
+def local_chiplet_ids(devices: list[Any] | None = None) -> set[int]:
+    """Return selected-mesh indices addressable by this process."""
     current_process = jax.process_index()
     return {
         index
-        for index, device in enumerate(jax.devices())
+        for index, device in enumerate(jax.devices() if devices is None else devices)
         if int(device.process_index) == current_process
     }
 
@@ -236,6 +339,8 @@ def compute_case_traffic_bytes(
     data_size_bytes: int,
     n_chiplets: int,
     n_tpus: int,
+    ar_parallel: bool = False,
+    a2a_parallel: bool = False,
 ) -> tuple[int | float, int | float, str, dict[str, Any]]:
     """Return total logical bytes and the bandwidth numerator for one case."""
     total_case_bytes = len(case.active_pairs) * data_size_bytes
@@ -258,49 +363,142 @@ def compute_case_traffic_bytes(
         return total_case_bytes, data_size_bytes, "single_chiplet_pair", metadata
 
     if benchmark == "a2a":
-        # data_size is the pre-split payload owned by each chiplet. all_to_all
-        # splits it into n_devices equal chunks. For ICI bandwidth we count only
-        # chunks whose source and destination are on different TPU chips, so each
-        # chiplet contributes (n_devices - 2) remote chunks.
-        per_tpu_chip_numerator = data_size_bytes * (n_chiplets - 2) * 2
-        if per_tpu_chip_numerator % n_chiplets == 0:
-            per_tpu_chip_bytes: int | float = (
-                per_tpu_chip_numerator // n_chiplets
-            )
-        else:
-            per_tpu_chip_bytes = per_tpu_chip_numerator / n_chiplets
-        total_inter_tpu_bytes = data_size_bytes * (n_chiplets - 2)
-        chunk_bytes = data_size_bytes // n_chiplets
-        metadata.update({
-            "bandwidth_formula": "data_size * (n_devices - 2) * 2 / n_devices",
-            "bandwidth_formula_scope": "average_per_tpu_chip_inter_tpu_ici",
-            "bandwidth_formula_participants": "jax_devices_chiplets",
+        # Uniform all-to-all: half the ranks send half their input across
+        # the cut in ONE direction. Parallel chiplet groups share the cut;
+        # sum their bytes, never sum their concurrently measured durations.
+        group_count = CHIPLETS_PER_TPU if a2a_parallel else 1
+        group_ranks = n_tpus if a2a_parallel else n_chiplets
+        bisection_bytes = data_size_bytes * group_ranks * group_count / 4
+        bisection_metadata = {
+            "bandwidth_formula": "data_size * ranks_per_group / 4 * parallel_groups",
+            "bandwidth_formula_scope": "one_way_bisection",
+            "bandwidth_formula_participants": "selected_block_chiplets",
             "bandwidth_formula_n_devices": n_chiplets,
-            "bandwidth_denominator_tpu_chips": n_tpus,
+            "bandwidth_formula_n_devices_per_group": group_ranks,
+            "bandwidth_formula_parallel_groups": group_count,
+            "bandwidth_accounting_mode": "uniform_alltoall_one_way_bisection",
+            "bandwidth_accounting_unit": "bisection",
+            "bisection_traffic_bytes": bisection_bytes,
+        }
+        if a2a_parallel:
+            if n_tpus <= 1:
+                raise ValueError("parallel all-to-all requires at least 2 TPU chips")
+            chunk_bytes = data_size_bytes // n_tpus
+            per_chiplet_ici_bytes = chunk_bytes * (n_tpus - 1)
+            per_tpu_chip_ici_bytes = per_chiplet_ici_bytes * CHIPLETS_PER_TPU
+            total_inter_tpu_bytes = (
+                data_size_bytes * (n_tpus - 1) * CHIPLETS_PER_TPU
+            )
+            metadata.update({
+                "all_to_all_parallel": True,
+                "all_to_all_parallel_group_count": CHIPLETS_PER_TPU,
+                "all_to_all_parallel_group_size": n_tpus,
+                "all_to_all_input_bytes_per_chiplet": data_size_bytes,
+                "all_to_all_chunk_bytes": chunk_bytes,
+                "all_to_all_remote_tpu_chunks_per_chiplet": n_tpus - 1,
+                "all_to_all_inter_tpu_bytes_per_chiplet": per_chiplet_ici_bytes,
+                "all_to_all_inter_tpu_bytes_per_tpu_chip": (
+                    per_tpu_chip_ici_bytes
+                ),
+                "all_to_all_total_inter_tpu_bytes": total_inter_tpu_bytes,
+            })
+            return (
+                total_inter_tpu_bytes,
+                bisection_bytes,
+                "one_way_bisection",
+                {**metadata, **bisection_metadata},
+            )
+
+        # Retain logical inter-chip byte counts as diagnostics only. They
+        # exclude forwarded traffic and are NOT the bandwidth numerator.
+        remote_chunks_per_chiplet = n_chiplets - CHIPLETS_PER_TPU
+        chunk_bytes = data_size_bytes // n_chiplets
+        per_chiplet_ici_bytes = chunk_bytes * remote_chunks_per_chiplet
+        per_tpu_chip_ici_bytes = per_chiplet_ici_bytes * CHIPLETS_PER_TPU
+        total_inter_tpu_bytes = per_chiplet_ici_bytes * n_chiplets
+        metadata.update({
+            "all_to_all_parallel": False,
             "all_to_all_input_bytes_per_chiplet": data_size_bytes,
             "all_to_all_chunk_bytes": chunk_bytes,
             "all_to_all_remote_tpu_chunks_per_chiplet": (
-                n_chiplets - CHIPLETS_PER_TPU
+                remote_chunks_per_chiplet
             ),
             "all_to_all_inter_tpu_bytes_per_chiplet": (
-                chunk_bytes * (n_chiplets - CHIPLETS_PER_TPU)
+                per_chiplet_ici_bytes
             ),
-            "all_to_all_inter_tpu_bytes_per_tpu_chip": per_tpu_chip_bytes,
+            "all_to_all_inter_tpu_bytes_per_tpu_chip": (
+                per_tpu_chip_ici_bytes
+            ),
             "all_to_all_total_inter_tpu_formula": (
-                "data_size * (n_devices - 2)"
+                "data_size * (n_devices - chiplets_per_tpu)"
             ),
             "all_to_all_total_inter_tpu_bytes": total_inter_tpu_bytes,
         })
         return (
             total_inter_tpu_bytes,
-            per_tpu_chip_bytes,
-            "average_per_tpu_chip_inter_tpu_ici",
-            metadata,
+            bisection_bytes,
+            "one_way_bisection",
+            {**metadata, **bisection_metadata},
         )
 
     if benchmark == "ar":
         if n_chiplets <= 1:
             raise ValueError("all-reduce requires at least 2 chiplets")
+
+        if ar_parallel:
+            # Parallel AllReduce splits the 2-D mesh by chiplet index:
+            #   group 0: chiplet 0 across all TPU chips
+            #   group 1: chiplet 1 across all TPU chips
+            #
+            # Each group contains n_tpus ranks. The NCCL-style bus numerator
+            # per participant is data_size * 2 * (n_tpus - 1) / n_tpus. Because
+            # the two chiplet groups run in parallel, the effective single-TPU
+            # chip ICI bandwidth sums both chiplets on the chip.
+            per_chiplet_bus_bytes = (
+                data_size_bytes * 2 * (n_tpus - 1) / n_tpus
+            )
+            per_tpu_chip_bus_bytes = per_chiplet_bus_bytes * CHIPLETS_PER_TPU
+            total_bus_bytes = (
+                data_size_bytes * 2 * (n_tpus - 1) * CHIPLETS_PER_TPU
+            )
+            metadata.update({
+                "bandwidth_formula": (
+                    "data_size * 2 * (n_devices_per_group - 1) / "
+                    "n_devices_per_group * parallel_groups"
+                ),
+                "bandwidth_formula_scope": (
+                    "single_tpu_chip_parallel_allreduce_bus"
+                ),
+                "bandwidth_formula_participants": (
+                    "two_parallel_chiplet_groups"
+                ),
+                "bandwidth_formula_n_devices_per_group": n_tpus,
+                "bandwidth_formula_parallel_groups": CHIPLETS_PER_TPU,
+                "bandwidth_accounting_mode": (
+                    "parallel_per_tpu_chip_aggregate"
+                ),
+                "bandwidth_accounting_unit": "tpu_chip",
+                "all_reduce_parallel": True,
+                "all_reduce_parallel_group_count": CHIPLETS_PER_TPU,
+                "all_reduce_parallel_group_size": n_tpus,
+                "all_reduce_payload_bytes_per_device": data_size_bytes,
+                "all_reduce_bus_factor_per_group": (
+                    2 * (n_tpus - 1) / n_tpus
+                ),
+                "all_reduce_bus_bytes_per_chiplet": per_chiplet_bus_bytes,
+                "all_reduce_bus_bytes_per_tpu_chip": per_tpu_chip_bus_bytes,
+                "all_reduce_total_bus_formula": (
+                    "data_size * 2 * (n_devices_per_group - 1) * "
+                    "parallel_groups"
+                ),
+                "all_reduce_total_bus_bytes": total_bus_bytes,
+            })
+            return (
+                total_bus_bytes,
+                per_tpu_chip_bus_bytes,
+                "single_tpu_chip_parallel_allreduce_bus",
+                metadata,
+            )
 
         # Standard AllReduce bus-bandwidth numerator per participating device.
         # In this benchmark n_devices is the number of JAX devices/chiplets.
@@ -321,6 +519,10 @@ def compute_case_traffic_bytes(
             "bandwidth_formula_scope": "average_per_device_allreduce_bus",
             "bandwidth_formula_participants": "jax_devices_chiplets",
             "bandwidth_formula_n_devices": n_chiplets,
+            "bandwidth_accounting_mode": (
+                "non_parallel_per_chiplet_average"
+            ),
+            "bandwidth_accounting_unit": "chiplet",
             "all_reduce_bus_factor": (
                 2 * (n_chiplets - 1) / n_chiplets
             ),
@@ -376,6 +578,8 @@ def get_device_coords(device: Any) -> tuple[int, int, int] | None:
 
 def infer_tpu_topology(
     devices: list[Any] | None = None,
+    *,
+    normalize_origin: bool = False,
 ) -> tuple[tuple[int, int, int], str, list[tuple[int, int, int]]]:
     """Infer TPU chip topology from JAX device coordinates."""
     jax_devices = list(jax.devices() if devices is None else devices)
@@ -391,6 +595,18 @@ def infer_tpu_topology(
                 f"{index} does not expose chip coordinates: {device!r}"
             )
         chip_coords.append(coords)
+
+    topology_source = "tpu_chip_coords"
+    if normalize_origin:
+        origin = tuple(
+            min(coord[axis] for coord in chip_coords)
+            for axis in range(3)
+        )
+        chip_coords = [
+            tuple(coord[axis] - origin[axis] for axis in range(3))
+            for coord in chip_coords
+        ]
+        topology_source = "local_tpu_chip_coords"
 
     if len(chip_coords) % CHIPLETS_PER_TPU != 0:
         raise ValueError(
@@ -464,7 +680,7 @@ def infer_tpu_topology(
             f"inferred topology {format_topology(topology)}"
         )
 
-    return topology, "tpu_chip_coords", ordered_chip_coords
+    return topology, topology_source, ordered_chip_coords
 
 
 def parse_traffic_matrix(matrix_str: str) -> list[list[int]]:

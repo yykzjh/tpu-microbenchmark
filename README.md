@@ -1,305 +1,202 @@
 # TPU Microbenchmark
 
-TPU microbenchmark suite for measuring key performance metrics of TPU hardware, covering memory bandwidth, matrix computation throughput, PCIe transfer bandwidth, and inter-chip interconnect bandwidth.
+Standalone TPU benchmarks for GEMM, host/device transfers, HBM, VMEM and ICI.
+The Python programs and Bash launchers run directly on TPU VMs or existing
+TPU containers; no acceptance service or scheduler integration is required.
 
-## Directory Structure
+## Install on every host
 
-```
-├── pyproject.toml              # uv project configuration and dependencies
-├── scripts/
-│   └── cleanup_tpu_tests.sh    # Test process cleanup script
-└── src/
-    ├── memory/                 # HBM / VMEM memory bandwidth tests
-    │   ├── test_hbm.py         # HBM bandwidth benchmark (read/write/copy)
-    │   ├── test_vmem.py        # VMEM bandwidth benchmark
-    │   ├── kernels.py          # Pallas TPU kernels
-    │   ├── arrays.py           # Test array construction
-    │   ├── benchmark.py        # Benchmark execution orchestration
-    │   └── options.py          # CLI arguments and result output
-    ├── gemm/                   # Matrix multiplication (GEMM) compute throughput tests
-    │   └── test_gemm.py
-    ├── pcie/                   # PCIe host-device transfer bandwidth tests
-    │   └── test_pcie.py
-    ├── ici/                    # ICI inter-chip interconnect bandwidth tests
-    │   ├── test_ici.py         # CLI entry point (raw/p2p/p2p-rdma/a2a/ar)
-    │   ├── runner.py           # Benchmark orchestration
-    │   ├── kernels.py          # JAX/Pallas communication kernels
-    │   ├── traffic.py          # Topology inference and traffic matrix
-    │   ├── phases.py           # Execution phases (warmup/timed)
-    │   ├── constants.py        # Shared constants
-    │   ├── cleanup.py          # Runtime memory management
-    │   └── zero_crop.py        # ZeroCrop FFI custom primitive
-    └── utils/                  # Shared utilities
-        ├── runtime.py          # TPU environment setup and JAX initialization
-        ├── profiling.py        # xprof tracing and HLO dump
-        ├── metrics.py          # Statistical metrics and JSONL output
-        └── units.py            # Data size parsing and unit conversion
-```
-
-## Prerequisites
-
-- **Hardware**: TPU device (ICI tests require multi-chip TPU; other tests work with a single chip)
-- **OS**: Linux x86_64 (JAX TPU only supports Linux)
-- **Python**: >= 3.12
-- **Package Manager**: [uv](https://docs.astral.sh/uv/)
-
-## Installation
+Requires Linux x86_64, Python 3.12+, Bash 4+, and a working TPU runtime/device
+assignment. Distributed launchers also require OpenSSH client/server, `tar`,
+`awk`, coreutils and `ip` (iproute2). The optional network test requires
+iperf **2** and numactl on both hosts. This repository does not provision VMs,
+start containers, install host TPU drivers or create SSH keys.
 
 ```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create virtual environment and install dependencies
-uv sync
+git clone https://github.com/yykzjh/tpu-microbenchmark.git
+cd tpu-microbenchmark
+uv sync --locked
 ```
 
-uv will automatically install all dependencies from PyPI and Google JAX releases, including `jax[tpu]`, `jaxlib`, `libtpu`, etc.
+The dependency file is `pyproject.toml`; `uv.lock` records the reproducible
+resolution. Runtime versions are JAX/JAXlib 0.11.1, libtpu 0.0.46 and tpu-info
+0.14.2, matching the synchronized benchmark environment. Dependencies resolve
+from public sources only. TPU execution still requires real TPU hardware;
+CPU-only regression tests do not verify TPU performance.
 
-## Recommended Test Commands
+For SSH launchers, clone the same revision at the **same absolute path** on
+every host and run `uv sync --locked` in each clone. Each launcher automatically
+uses its own repository's `.venv/bin` and `src/`. No global `PYTHONPATH`,
+`/root/bin` installation or platform-generated environment file is required.
+Use the host/container environment supplied for that Slice; do not copy a
+single host's TPU worker identity to other hosts.
 
-All tests are standalone CLI scripts, run via `uv run python -m` (not pytest). Each test automatically configures TPU/XLA environment variables before running.
+## Input files and SSH requirements
 
-### GEMM Compute Throughput Test
+| Entry point | Required input file |
+| --- | --- |
+| Direct Python GEMM / PCIe / HBM / VMEM | None |
+| Direct Python ICI with `--runtime-scope local` | None |
+| Direct Python ICI with `--runtime-scope slice` | None; launch every host with explicit coordinator, process count and rank |
+| Shell GEMM / TPUBandwidth launchers | `--hostfile` and `--master` |
+| Shell multi-host ICI | `--hostfile` |
+| Shell iperf | `--hostfile`, with a two-host selection |
 
-Measures matrix multiplication (GEMM) TFLOP/s.
+Create your own `hostfile` in the repository, one reachable host/IP per line:
+
+```text
+tpu-host-0
+tpu-host-1
+tpu-host-2
+tpu-host-3
+```
+
+Blank lines and lines starting with `#` are ignored. Use unique bare hostnames
+or IPv4 addresses, **not** `user@host`, ports, YAML or JSON. Replace the example
+names with addresses reachable between the test containers/VMs. Real hostfiles
+are gitignored and should not be published.
+
+For ICI, the first host is rank 0 and the coordinator; **run the shell command
+on that host**, and keep the hostfile in a stable order. The launcher reads the
+file once and forwards the host list, so remote hosts do not need a copy of
+the hostfile. All hosts must have the same checkout and Python environment.
+
+SSH must work noninteractively between all participating hosts (binary-tree
+fan-out), using the same login and port. Defaults: current user and port 22.
+For existing root containers, use `--ssh-user root --ssh-port 2222` if that
+is their configured SSH port. Host-key checking uses `accept-new`; changed
+keys fail. Distribute/verify keys using your normal administration process.
+TCP 8476 (the JAX coordinator) and the TPU runtime communication paths must
+also be reachable. Do not run concurrent benchmarks against the same Slice.
+
+## Retest a 2x2x2 AllReduce block within a 2x2x4 Slice
+
+Keep **all four hosts** of the 2x2x4 Slice in the hostfile. Every host joins
+distributed JAX initialization, but communication is restricted to the selected
+chip block. Do not reduce the hostfile to just the two hosts in that block.
+Block coordinates are chip coordinates, not hostfile indices; Python discovers
+the device topology at runtime.
+
+From host 0, inside the repository:
 
 ```bash
-# fp16
-uv run python -m src.gemm.test_gemm \
-  --m 32768 \
-  --n 32768 \
-  --k 32768 \
-  --dtype fp16 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# bf16
-uv run python -m src.gemm.test_gemm \
-  --m 32768 \
-  --n 32768 \
-  --k 32768 \
-  --dtype bf16 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# fp8
-uv run python -m src.gemm.test_gemm \
-  --m 32768 \
-  --n 32768 \
-  --k 32768 \
-  --dtype fp8 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
+bash scripts/ici/test_multinode_ici.sh \
+  --hostfile ./hostfile \
+  --mode allreduce_parallel \
+  --block-range '0:2,0:2,0:2' \
+  --allreduce-data-size 4GiB \
+  --warmup 2 --iterations 5 \
+  --xprof-timing
 ```
 
-**Parameters:**
+This launches only parallel AllReduce, with temporary Xprof device timing.
+For root containers append `--ssh-user root --ssh-port 2222`.
+The root collects one log per host under `logs/ici/`. Successful execution
+means the benchmark completed and produced metrics, not that a performance
+threshold was met. Non-participating ranks may have no block metric.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--m` | (required) | Matrix M dimension |
-| `--n` | (required) | Matrix N dimension |
-| `--k` | (required) | Matrix K dimension |
-| `--dtype` | `bf16` | Input data type: `fp32`, `fp16`, `bf16`, `fp8` |
-| `--warmup` | `2` | Number of warmup iterations |
-| `--iteration` | `5` | Number of timed iterations |
-| `--result-dir` | `./results` | Output directory for results |
-| `--dump-hlo` | `false` | Collect XLA HLO dump |
-| `--cleanup-trace` | `false` | Delete xprof trace after extracting timings |
+To compare another block, rerun sequentially with
+`--block-range '0:2,0:2,1:3'` or `'0:2,0:2,2:4'`. To compare CPU timing,
+omit `--xprof-timing`; do not change any other parameters.
 
-### PCIe Transfer Bandwidth Test
-
-Measures CPU <-> TPU PCIe transfer bandwidth (GB/s).
+Without SSH, execute the Python program **on all four hosts concurrently**,
+using the same coordinator and count and a unique rank 0, 1, 2, 3:
 
 ```bash
-# Host-to-Device (CPU -> TPU)
-uv run python -m src.pcie.test_pcie h2d \
-  --data-size 1GiB \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results
-
-# Device-to-Host (TPU -> CPU)
-uv run python -m src.pcie.test_pcie d2h \
-  --data-size 1GiB \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results
+# Set RANK to this host's index in the four-host process group.
+RANK=0
+uv run --locked python src/ici/test_ici.py ar \
+  --runtime-scope slice \
+  --coordinator-address tpu-host-0:8476 \
+  --process-count 4 --process-id "$RANK" \
+  --block-range '0:2,0:2,0:2' \
+  --data-size 4GiB --warmup 2 --iteration 5 \
+  --parallel --xprof-timing
 ```
 
-**Parameters:**
+Python writes results to stdout; redirect stdout/stderr yourself if using this
+manual launch method. Only the shell launcher collects per-host logs.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `h2d` / `d2h` | (required) | Subcommand: `h2d` (host->device) or `d2h` (device->host) |
-| `--data-size` | (required) | Transfer size per target device, must be aligned to 512 bytes |
-| `--warmup` | `2` | Number of warmup iterations |
-| `--iteration` | `5` | Number of timed iterations |
-| `--target-devices` | `8` | Number of TPU chiplet devices to test (default 8 = 4 chips x 2 chiplets) |
-| `--result-dir` | `./results` | Output directory for results |
-| `--cleanup-trace` | `false` | Delete xprof trace after extracting timings |
+## Other benchmarks
 
-Each direction tests two modes:
-- **one_to_one**: Sequential transfer per device
-- **one_to_many**: Concurrent transfer across all devices
-
-### HBM Bandwidth Test
-
-Measures HBM (High Bandwidth Memory) read/write/copy bandwidth.
+Direct Python commands run on the current host only and need no hostfile:
 
 ```bash
-# Read
-uv run python -m src.memory.test_hbm \
-  --mode read \
-  --data-size 4GiB \
-  --block-shape 4096 1024 \
-  --dtype float32 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# Write
-uv run python -m src.memory.test_hbm \
-  --mode write \
-  --data-size 4GiB \
-  --block-shape 4096 1024 \
-  --dtype float32 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# Copy
-uv run python -m src.memory.test_hbm \
-  --mode copy \
-  --data-size 4GiB \
-  --block-shape 4096 1024 \
-  --dtype float32 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
+uv run --locked python src/gemm/test_gemm.py \
+  --m 32768 --n 32768 --k 32768 --dtype bf16 --warmup 2 --iteration 5
+uv run --locked python src/pcie/test_pcie.py h2d \
+  --data-size 1GiB --target-devices 8 --pcie-mode one_to_one
+uv run --locked python src/memory/test_hbm.py \
+  --mode write --data-size 4GiB --block-shape 2048 1024 --dtype float32
+uv run --locked python src/memory/test_vmem.py \
+  --data-size 4GiB --block-shape 2048 1024 --dtype float32
+uv run --locked python src/ici/test_ici.py ar \
+  --runtime-scope local --data-size 4GiB --parallel
 ```
 
-**Parameters:**
+Use `--dtype fp16/bf16/fp8` for GEMM; `h2d/d2h` for PCIe; and
+`--mode read/write/copy` for HBM. GEMM and memory programs use local devices;
+ICI distinguishes independent `local` from distributed `slice` execution.
+A local collective does not validate the full cross-host Slice.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--mode` | `all` | Test mode: `read`, `write`, `copy`, `all` |
-| `--data-size` | `256MiB` | HBM data size, must be aligned to block shape |
-| `--block-shape` | `128 1024` | Pallas block shape; last dimension must be divisible by 128, second-to-last dimension must be divisible by 8. Recommended: `4096 1024` for HBM, `2048 1024` for VMEM |
-| `--dtype` | `float32` | Data type: `float32`, `float16`, `bfloat16` |
-| `--warmup` | `2` | Number of warmup iterations |
-| `--iteration` | `5` | Number of timed iterations |
-| `--result-dir` | `./results` | Output directory for results |
-| `--dump-hlo` | `false` | Collect XLA HLO dump |
-| `--cleanup-trace` | `false` | Delete xprof trace after extracting timings |
-
-### VMEM Bandwidth Test
-
-Measures VMEM (Vector Memory / on-chip vector memory) copy bandwidth.
+For single-node tests across several hosts, use the dedicated shell launchers
+from the host named by `--master`. Each host runs its local devices independently:
 
 ```bash
-uv run python -m src.memory.test_vmem \
-  --data-size 4GiB \
-  --block-shape 2048 1024 \
-  --dtype float32 \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
+bash scripts/gemm/test_gemm.sh \
+  --hostfile ./hostfile --master tpu-host-0 --dtype fp16,bf16,fp8
+bash scripts/tpubandwidth/test_tpubandwidth.sh \
+  --hostfile ./hostfile --master tpu-host-0 \
+  --mode h2d,d2h,hbm_write --xprof-modes hbm_write
 ```
 
-Parameters are the same as the HBM test (VMEM test does not include `--mode`; it is fixed to VMEM copy mode).
+A one-line hostfile runs these shell launchers on just that host.
 
-### ICI Interconnect Bandwidth Test
-
-Measures TPU inter-chip interconnect (ICI) bandwidth. Requires a multi-chip TPU environment.
+Full-Slice P2P and collective examples (run sequentially from host 0):
 
 ```bash
-# P2P (using raw subcommand + custom traffic matrix, 8x8 TPU chips)
-uv run python -m src.ici.test_ici \
-  raw \
-  --traffic-matrix "#1,0,0,0,0,0,0,1#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0#0,0,0,0,0,0,0,0" \
-  --data-size 1GiB \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# All-to-All collective communication
-uv run python -m src.ici.test_ici a2a \
-  --data-size 1GiB \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
-
-# All-Reduce (psum) collective communication
-uv run python -m src.ici.test_ici ar \
-  --data-size 4GiB \
-  --warmup 2 \
-  --iteration 5 \
-  --result-dir ./commpilot_results \
-  --dump-hlo
+bash scripts/ici/test_multinode_ici.sh \
+  --hostfile ./hostfile --mode p2p --p2p-pair-mode neighbors --xprof-timing
+bash scripts/ici/test_multinode_ici.sh \
+  --hostfile ./hostfile \
+  --mode allreduce,allreduce_parallel,alltoall,alltoall_parallel \
+  --xprof-modes allreduce,allreduce_parallel
 ```
 
-**Subcommands:**
+`neighbors` skips Self, tests both chiplets bidirectionally within every chip,
+and tests chiplet 0 to chiplet 0 on adjacent chips. For a 2x2x4 mesh this is
+32 Die-to-Die plus 56 directed Chip-to-Chip pairs. Axes up to length 4 do not
+wrap. Larger Slice adjacency is deliberately rejected in this mode.
 
-| Subcommand | Description |
-|------------|-------------|
-| `raw` | User-defined traffic matrix, supports `--traffic-matrix` and `--concurrent` |
-| `p2p` | Built-in all-ones traffic matrix, per-link breakdown test |
-| `p2p-rdma` | Per-link P2P test using Pallas Remote DMA |
-| `a2a` | All-to-All collective communication, reports inter-TPU ICI bandwidth |
-| `ar` | All-Reduce (psum), reports bus bandwidth |
+## Logs and timing
 
-**Parameters:**
+Shell logs are timestamped and include node identity, per-stage wall times,
+and `[COMMPILOT_METRIC]` structured results for compatibility. They live in
+`logs/gemm/`, `logs/tpubandwidth/`, `logs/ici/` or `logs/iperf/`.
+No result log is automatically uploaded.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--data-size` | (required) | Payload size, must be aligned to 4096 bytes (8x128 float32) |
-| `--warmup` | `2` | Number of warmup iterations |
-| `--iteration` | `5` | Number of timed iterations |
-| `--result-dir` | `./results` | Output directory for results |
-| `--dump-hlo` | `false` | Collect XLA HLO dump |
-| `--cleanup-trace` | `false` | Delete xprof trace after extracting timings |
-| `--traffic-matrix` | (raw only) | Traffic matrix, format: `#0,1#1,0` (each row starts with `#`, separated by `,`) |
-| `--concurrent` | (raw only) | Run in single-matrix mode (default splits into per-link tests) |
+CPU timing is the default. `--xprof-timing` selects device-trace timing;
+shell `--xprof-modes <csv>` selects individual subtests and, when nonempty,
+overrides the all-subtests switch. Xprof collection adds wall-clock overhead.
+Temporary traces are removed after timing; `--profile` explicitly retains
+trace/HLO artifacts. The updated collective kernels use resident inputs and
+return real outputs without the old ZeroCrop timing consumer.
 
-## Output Results
+The optional `scripts/oss/upload-logs-to-oss.sh` needs an installed `ossutil`
+and your own `OSS_PATH/OSS_AK/OSS_SK/OSS_ENDPOINT/OSS_REGION` environment
+variables. It is not a test prerequisite. Never commit credentials or logs.
+Use `--logs-dir` if uploading logs outside this repository.
 
-Each test creates a timestamped output directory under `--result-dir`, containing:
+`scripts/cleanup_tpu_tests.sh --dry-run` previews matching local benchmark
+processes. Review before executing without `--dry-run`: it stops benchmarks
+and removes the libtpu lock file. Never use it on a host with another active
+TPU workload.
 
-- `metrics/metrics_report.jsonl` -- Structured JSONL metrics, including bandwidth, latency percentiles, etc.
-- `trace/` -- xprof trace files
-- `dump_hlo/` -- XLA HLO dump (requires `--dump-hlo`)
-
-## Test Cleanup
-
-After tests complete (especially after abnormal exits), run the cleanup script to release TPU resources:
+## Regression tests
 
 ```bash
-# Clean up residual test processes and libtpu lock files
-bash scripts/cleanup_tpu_tests.sh
-
-# Preview what will be cleaned (without actually executing)
-bash scripts/cleanup_tpu_tests.sh --dry-run
+uv run --locked --group dev pytest -q
 ```
 
-The cleanup script will:
-1. Terminate residual processes matching TPU test patterns (`test_hbm`, `test_vmem`, `test_gemm`, `test_pcie`, `test_ici`)
-2. Delete `/tmp/libtpu_lockfile` lock files (which may be left behind by crashed tests)
-
-## Test Isolation Notes
-
-- **Each test must run independently**: Each test sets different `LIBTPU_INIT_ARGS` XLA compilation flags before importing JAX; these flags cannot be changed within the same process
-- **Sequential execution**: Tests should run serially to avoid TPU resource contention
-- **Recommended execution order**: HBM -> VMEM -> GEMM -> PCIe -> ICI, running the cleanup script between each test
-- **ICI tests must be isolated**: Calls `jax.distributed.initialize()` to establish global multi-host state, which cannot be re-initialized within the same process
+These CPU-only tests cover timing boundaries, traffic accounting and launcher
+contracts. Actual TPU execution and measured bandwidth require hardware.

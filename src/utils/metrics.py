@@ -10,7 +10,35 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from typing import Any
+
+
+METRIC_LOG_PREFIX = "[COMMPILOT_METRIC]"
+
+
+def emit_log_metric(
+    *,
+    testcase: str,
+    metric: str,
+    value: int | float,
+    unit: str,
+    device: str | int | None = None,
+    dimensions: dict[str, Any] | None = None,
+) -> None:
+    """Print one stable JSON metric record into the benchmark log."""
+    record: dict[str, Any] = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "testcase": testcase,
+        "metric": metric,
+        "value": round(float(value), 4),
+        "unit": unit,
+    }
+    if device is not None:
+        record["device"] = str(device)
+    if dimensions:
+        record["dimensions"] = dimensions
+    print(f"{METRIC_LOG_PREFIX} {json.dumps(record, separators=(',', ':'))}")
 
 
 class MetricsStatistics:
@@ -112,7 +140,7 @@ def average_min_max(
 
 
 def write_jsonl_metrics(
-    metrics_dir: str,
+    metrics_dir: str | None,
     test_name: str,
     metadata: dict[str, Any],
     metrics: dict[str, Any],
@@ -122,6 +150,8 @@ def write_jsonl_metrics(
     Appends to ``metrics_report.jsonl`` so multiple test runs in the same
     directory accumulate in a single file.
     """
+    if metrics_dir is None:
+        return
     os.makedirs(metrics_dir, exist_ok=True)
     filepath = os.path.join(metrics_dir, "metrics_report.jsonl")
 
