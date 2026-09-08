@@ -69,6 +69,10 @@ also be reachable. Do not run concurrent benchmarks against the same Slice.
 
 ## Retest AllReduce on a two-host 2x2x2 Slice
 
+For the original block-to-block observation, exact two-host reproduction steps,
+SparseCore on/off control, bandwidth accounting, and anonymized measurements,
+see [AllReduce performance variance](docs/allreduce-performance-variance.md).
+
 Use an **independent two-host 2x2x2 Slice**, with four TPU chips per host.
 Put both hosts in the two-line hostfile above. The launcher derives the process
 count from this file; Python discovers the device topology at runtime. Omitting

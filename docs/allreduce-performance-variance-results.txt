@@ -1,0 +1,84 @@
+# Sanitized L20G7 AllReduce result log
+# Raw node names, IP addresses, task IDs, run IDs, and private paths removed.
+# Times are UTC. The two sections are separate test executions.
+
+=== ORIGINAL 2x2x4 SLICE / SLIDING 2x2x2 BLOCKS ===
+test_date=2026-09-04
+benchmark=allreduce_parallel
+primitive=jax.lax.psum
+slice_topology=2x2x4
+block_topology=2x2x2
+tpu_chips_per_block=8
+chiplets_per_block=16
+parallel_groups=2
+participants_per_group=8
+data_size_per_chiplet=4294967296
+data_size_label=4GiB
+payload_dtype=float32
+warmup=2
+iterations=5
+timing_source=cpu_wall_clock_with_block_until_ready
+independent_process_repetitions_per_block=1
+source_default_sc_allreduce_offload=true
+resolved_runtime_sc_allreduce_offload=not_recorded
+hlo_or_xprof_artifacts=not_retained
+bandwidth_scope=single_tpu_chip_parallel_allreduce_bus
+bandwidth_traffic_bytes=15032385536
+
+[2026-09-04T06:47:29+00:00] block_range=0:2,0:2,0:2 event=start
+[2026-09-04T06:47:36+00:00] block_range=0:2,0:2,0:2 phase=warmup iterations=2
+[2026-09-04T06:47:36+00:00] block_range=0:2,0:2,0:2 phase=timed iterations=5
+[2026-09-04T06:47:37+00:00] block_range=0:2,0:2,0:2 duration_min_ms=81.0865 duration_avg_ms=81.1194 duration_p50_ms=81.1234 duration_max_ms=81.1438 bandwidth_GBps=185.3027 status=success
+[2026-09-04T06:47:42+00:00] block_range=0:2,0:2,0:2 event=end
+
+[2026-09-04T06:48:17+00:00] block_range=0:2,0:2,1:3 event=start
+[2026-09-04T06:48:27+00:00] block_range=0:2,0:2,1:3 phase=warmup iterations=2
+[2026-09-04T06:48:27+00:00] block_range=0:2,0:2,1:3 phase=timed iterations=5
+[2026-09-04T06:48:28+00:00] block_range=0:2,0:2,1:3 duration_min_ms=56.8214 duration_avg_ms=56.8548 duration_p50_ms=56.8317 duration_max_ms=56.9551 bandwidth_GBps=264.5071 status=success
+[2026-09-04T06:48:32+00:00] block_range=0:2,0:2,1:3 event=end
+
+[2026-09-04T06:49:08+00:00] block_range=0:2,0:2,2:4 event=start
+[2026-09-04T06:49:19+00:00] block_range=0:2,0:2,2:4 phase=warmup iterations=2
+[2026-09-04T06:49:19+00:00] block_range=0:2,0:2,2:4 phase=timed iterations=5
+[2026-09-04T06:49:19+00:00] block_range=0:2,0:2,2:4 duration_min_ms=56.8016 duration_avg_ms=56.8355 duration_p50_ms=56.8280 duration_max_ms=56.8869 bandwidth_GBps=264.5243 status=success
+[2026-09-04T06:49:24+00:00] block_range=0:2,0:2,2:4 event=end
+
+reference_blocks_mean_GBps=264.5157
+first_block_delta_percent=-29.9464
+observation=the_first_block_is_slow_while_both_overlapping_reference_blocks_agree
+
+=== INDEPENDENT TWO-HOST 2x2x2 SLICE / SC OFFLOAD A-B ===
+test_date=2026-09-04
+benchmark=allreduce_parallel
+primitive=jax.lax.psum
+slice_topology=2x2x2
+tpu_chips=8
+chiplets=16
+parallel_groups=2
+participants_per_group=8
+data_size_per_chiplet=4294967296
+data_size_label=4GiB
+payload_dtype=float32
+warmup=2
+iterations=5
+timing_source=xprof
+profile=true
+changed_flag=xla_tpu_enable_sparse_core_collective_offload_all_reduce
+
+sc_allreduce_offload=true allreduce_device_p50_ms=53.8033 bandwidth_GBps=279.3958 full_device_program_ms=56.5688 wall_time_seconds=19.76 status=success
+sc_allreduce_offload=false allreduce_device_p50_ms=80.8454 bandwidth_GBps=185.9443 full_device_program_ms=80.9307 wall_time_seconds=18.33 status=success
+
+sc_enabled_collective_duration_delta_percent=-33.4491
+sc_enabled_bandwidth_delta_percent=50.2578
+sc_enabled_full_program_duration_delta_percent=-30.1022
+hlo_before_optimizations=byte_identical
+sc_enabled_hlo=OFFLOAD_COLLECTIVE,sparsecore,use_n_dimension_strategy_true
+sc_disabled_hlo=ordinary_allreduce
+zero_crop_events=0
+
+=== INTERPRETATION BOUNDARY ===
+The controlled A-B test proves that SparseCore offload selects a faster device
+implementation on the independent two-host Slice. Its disabled result is close
+to the original slow block, but numerical similarity alone does not prove that
+the original block failed to offload. The original block HLO/trace was not
+retained, so link/routing effects and compiler-path differences remain open.
